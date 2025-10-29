@@ -1,0 +1,33 @@
+[project]
+name = "scgpt-age"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flash-attn<1.0.5",
+    "ninja>=1.13.0",
+    "packaging>=25.0",
+    "psutil>=7.1.2",
+    "scgpt>=0.2.4",
+    "scvi-tools>=0.20.0,<1.0.0", # Fixed: compatible version range
+    "setuptools>=80.9.0",
+    "torch>=2.0.0", # Lowered: 2.9.0 might be too new
+    "jax>=0.4.25,<0.5.0",
+    "jaxlib>=0.4.25,<0.5.0",
+    "torchtext==0.16.2",
+    "pyarrow==16.0.0",
+    "numpy<2",
+    "anndata>=0.10.9",
+    "mudata>=0.3.2",
+    "pip>=25.3",
+    "scipy==1.13.0",
+]
+
+[build-system]
+requires = ["setuptools", "wheel", "torch>=2.0.0"]
+build-backend = "setuptools.build_meta"
+
+# Add this section to fix flash-attn build dependency
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
