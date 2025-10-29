@@ -1189,9 +1189,8 @@ for epoch in tqdm(range(1, epochs + 1)):
     if ADV:
         scheduler_D.step()
         scheduler_E.step()
-
-torch.save(best_model.state_dict(), save_dir / "model.pt")
-torch.save(best_model.state_dict(), "models/scGPT_Age/best_model.pt")
+        
+torch.save(best_model.state_dict(), save_dir / "best_model.pt")
 # %%
 all_counts = (
     adata_test.layers["X_binned"].A
@@ -1288,7 +1287,61 @@ predictions, probas = get_preds_and_probas(
 )
 adata_test.obs["scGPT_all_genes_predictions"] = predictions
 adata_test.obs["scGPT_all_genes_probas"] = probas
+adata_test.write_h5ad(save_dir / "test_data_subsampled_cells_genes_scGPT_all_genes.h5ad.gz",compression='gzip')
+#%%
+all_counts = (
+    adata_train.layers["X_binned"].A
+    if issparse(adata_train.layers["X_binned"])
+    else adata_train.layers["X_binned"]
+)
 
+age_labels = adata_train.obs["age_id"].tolist()  # make sure count from 0
+age_labels = np.array(age_labels)
+
+batch_ids = adata_train.obs["batch_id"].tolist()
+batch_ids = np.array(batch_ids)
+
+tokenized_test = tokenize_and_pad_batch(
+    all_counts,
+    gene_ids,
+    max_len=max_seq_len,
+    vocab=vocab,
+    pad_token=pad_token,
+    pad_value=pad_value,
+    append_cls=True,  # append <cls> token at the beginning
+    include_zero_gene=True,
+)
+
+input_values_test = random_mask_value(
+    tokenized_test["values"],
+    mask_ratio=mask_ratio,
+    mask_value=mask_value,
+    pad_value=pad_value,
+)
+
+test_data_pt = {
+    "gene_ids": tokenized_test["genes"],
+    "values": input_values_test,
+    "target_values": tokenized_test["values"],
+    "batch_labels": torch.from_numpy(batch_ids).long(),
+    "age_labels": torch.from_numpy(age_labels).long(),
+}
+
+test_loader = DataLoader(
+    dataset=SeqDataset(test_data_pt),
+    batch_size=eval_batch_size,
+    shuffle=False,
+    drop_last=False,
+)
+#%%
+model.eval()
+predictions, probas = get_preds_and_probas(
+    model,
+    loader=test_loader,
+)
+adata_train.obs["scGPT_all_genes_predictions"] = predictions
+adata_train.obs["scGPT_all_genes_probas"] = probas
+adata_train.write_h5ad(save_dir /"train_data_subsampled_cells_genes_scGPT_all_genes.h5ad.gz",compression='gzip')
 # %%
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
