@@ -31,6 +31,10 @@ from torchtext._torchtext import (
     Vocab as VocabPybind,
 )
 from sklearn.metrics import confusion_matrix
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_absolute_error, r2_score
 
 sys.path.insert(0, "../")
 import scgpt as scg
@@ -364,19 +368,20 @@ hyperparameter_defaults = dict(
     seed=0,
     dataset_name="AgeAnno_finall",
     do_train=True,
-    load_model="models/scGPT_Age",
+    load_model=SCGPT_MODEL_PATH,
     mask_ratio=0.0,
-    epochs=10,
+    epochs=5,
     n_bins=51,
     MVC=False,  # Masked value prediction for cell embedding
     ecs_thres=0.0,  # Elastic cell similarity objective, 0.0 to 1.0, 0.0 to disable
     dab_weight=0.0,
     lr=1e-4,
-    batch_size=32,  # TODO надо поменять
+    batch_size=8,  # TODO надо поменять
+    eval_batch_size=2,
     layer_size=128,
     nlayers=4,  # number of nn.TransformerEncoderLayer in nn.TransformerEncoder
     nhead=4,  # number of heads in nn.MultiheadAttention
-    dropout=0.4,  # dropout probability
+    dropout=0.2,  # dropout probability
     schedule_ratio=0.9,  # ratio of epochs for learning rate schedule
     save_eval_interval=5,
     fast_transformer=True,
@@ -389,6 +394,18 @@ hyperparameter_defaults = dict(
 # %%
 config = hyperparameter_defaults
 print(config)
+# Optimize CUDA/Flash attention backends
+torch.backends.cuda.matmul.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("medium")
+except Exception:
+    pass
+try:
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)
+except Exception:
+    pass
 # %%
 # settings for input and preprocessing
 pad_token = "<pad>"
@@ -432,7 +449,7 @@ per_seq_batch_sample = False
 lr = config["lr"]  # TODO: test learning rate ratio between two tasks
 lr_ADV = 1e-3  # learning rate for discriminator, used when ADV is True
 batch_size = config["batch_size"]
-eval_batch_size = config["batch_size"]
+eval_batch_size = config.get("eval_batch_size", config["batch_size"]) 
 epochs = config["epochs"]
 schedule_interval = 1
 
@@ -487,17 +504,19 @@ logger = scg.logger
 scg.utils.add_file_handler(logger, save_dir / "run.log")
     
 #%%
-adata_train = sc.read_h5ad(AGEANNO_ADATA_TRAIN)
-adata_test = sc.read_h5ad(AGEANNO_ADATA_TEST)
+adata_train = sc.read_h5ad("src/data/train_data_subsampled_cells_genes.h5ad.gz")
+adata_test = sc.read_h5ad("src/data/test_data_subsampled_cells_genes.h5ad.gz")
 #%%
 np.random.seed(0)
-genes = np.random.choice(adata_train.var["gene_name"], size=3000, replace=False)
+genes = np.random.choice(adata_train.var["gene_name"], size=2000, replace=False)
 #%%
 adata_train = adata_train[:, genes]
 adata_test = adata_test[:, genes]
 #%%
 adata_train.obs['genes_1'] = [genes for x in adata_train.obs.index]
 adata_test.obs['genes_1'] = [genes for x in adata_test.obs.index]
+# set max sequence length tightly to leverage flash attention efficiently
+max_seq_len = len(genes) + 1  # +1 for CLS
 # %%
 with open(f"{SCGPT_MODEL_PATH}/vocab.json", "r") as f:
     vocab = json.load(f)
@@ -1099,7 +1118,7 @@ def evaluate(model: nn.Module, loader: DataLoader, return_raw: bool = False) -> 
     total_num = 0
     predictions = []
     preds_all = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_data in loader:
             input_gene_ids = batch_data["gene_ids"].to(device)
             input_values = batch_data["values"].to(device)
@@ -1197,9 +1216,8 @@ for epoch in tqdm(range(1, epochs + 1)):
     if ADV:
         scheduler_D.step()
         scheduler_E.step()
-
+#%%
 torch.save(best_model.state_dict(), save_dir / "model.pt")
-torch.save(best_model.state_dict(), "models/scGPT_Age/best_model.pt")
 # %%
 def prepare_data_for_eval(adata_test):
     all_counts = (
@@ -1256,8 +1274,8 @@ def get_preds_and_probas(model: nn.Module, loader: DataLoader) -> float:
     """
     soft = nn.Softmax()
     predictions = []
-    preds_all = []
-    with torch.no_grad():
+    probas_all = []
+    with torch.inference_mode():
         for batch_data in tqdm(loader):
             input_gene_ids = batch_data["gene_ids"].to(device)
             input_values = batch_data["values"].to(device)
@@ -1285,9 +1303,9 @@ def get_preds_and_probas(model: nn.Module, loader: DataLoader) -> float:
 
             preds = output_values.argmax(1).cpu().numpy()
             predictions.append(preds)
-            preds_all.append(output_values)
+            probas_all.append(soft(output_values).detach().cpu().numpy()[:, 1])
     predictions_result = np.concatenate(predictions, axis=0)
-    preds_all_result = soft(torch.concat(preds_all))[:, 1].cpu().numpy()
+    preds_all_result = np.concatenate(probas_all, axis=0)
     return predictions_result, preds_all_result
 #%%
 RUN_ID = 'gene_1'
@@ -1297,8 +1315,9 @@ predictions, probas = get_preds_and_probas(
     model,
     loader=prepare_data_for_eval(adata_test),
 )
-adata_test.obs["scGPT_gene_1_predictions"] = predictions
-adata_test.obs["scGPT_gene_1_probas"] = probas
+#%%
+adata_train.write_h5ad("src/data/test_data_subsampled_cells_genes_scGPT_gene_1.h5ad.gz",compression='gzip')
+
 #%%
 predictions, probas = get_preds_and_probas(
     model,
@@ -1306,10 +1325,10 @@ predictions, probas = get_preds_and_probas(
 )
 adata_train.obs["scGPT_gene_1_predictions"] = predictions
 adata_train.obs["scGPT_gene_1_probas"] = probas
-adata_train.write_h5ad("src/data/test_data_subsampled_cells_genes_scGPT_gene_1.h5ad.gz",compression='gzip')
+#%%
 # %%
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
+age_labels = adata_test.obs["age_id"].tolist()
 accuracy = accuracy_score(age_labels, predictions)
 precision = precision_score(age_labels, predictions, average="macro")
 recall = recall_score(age_labels, predictions, average="macro")
@@ -1326,4 +1345,73 @@ results = {
     "test/recall": recall,
     "test/macro_f1": macro_f1,
 }
+# %%
+
+# %%
+def _get_dense_layer_matrix(adata: AnnData, preferred_layers: List[str]) -> np.ndarray:
+    for layer_name in preferred_layers:
+        if layer_name == "X" and hasattr(adata, "X") and adata.X is not None:
+            mat = adata.X
+        elif layer_name in adata.layers:
+            mat = adata.layers[layer_name]
+        else:
+            continue
+        return mat.A if issparse(mat) else np.asarray(mat)
+    raise ValueError("No suitable matrix found in preferred layers: " + ",".join(preferred_layers))
+
+
+def run_linear_baseline_ridge() -> Dict[str, float]:
+    X_train = _get_dense_layer_matrix(adata_train, ["X_log1p", "X_normed", "X_binned", "X"]).astype(np.float32)
+    X_test = _get_dense_layer_matrix(adata_test, ["X_log1p", "X_normed", "X_binned", "X"]).astype(np.float32)
+    y_train = np.asarray(adata_train.obs["age_id"], dtype=np.float32)
+    y_test = np.asarray(adata_test.obs["age_id"], dtype=np.int64)
+
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("ridge", Ridge(alpha=1.0, random_state=0)),
+    ])
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    # Metrics (regression + classification on rounded predictions)
+    r2 = r2_score(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    y_pred_round = np.clip(np.rint(y_pred), y_test.min(), y_test.max()).astype(int)
+    acc_rounded = (y_pred_round == y_test).mean()
+    acc = accuracy_score(y_test, y_pred_round)
+    precision = precision_score(y_test, y_pred_round, average="macro")
+    recall = recall_score(y_test, y_pred_round, average="macro")
+    macro_f1 = f1_score(y_test, y_pred_round, average="macro")
+
+    # Save predictions
+    adata_test.obs["baseline_ridge_age_pred"] = y_pred
+    adata_test.obs["baseline_ridge_age_pred_rounded"] = y_pred_round
+
+    logger.info(
+        f"Baseline Ridge — R2: {r2:.4f}, MAE: {mae:.4f}, Rounded Acc: {acc_rounded:.4f}, "
+        f"Acc: {acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, Macro F1: {macro_f1:.4f}"
+    )
+
+    return {
+        "baseline/r2": r2,
+        "baseline/mae": mae,
+        "baseline/acc_rounded": float(acc_rounded),
+        "baseline/accuracy": float(acc),
+        "baseline/precision": float(precision),
+        "baseline/recall": float(recall),
+        "baseline/macro_f1": float(macro_f1),
+    }
+
+
+# Run baseline after main model evaluation
+baseline_results = run_linear_baseline_ridge()
+
+# %%
+# Save selected genes to JSON for reproducibility
+genes_list = [str(g) for g in list(genes)]
+with open(save_dir / "genes.json", "w") as f:
+    json.dump(genes_list, f)
+# %%
+with open("save/dev_AgeAnno_finall-Oct30-13-50/genes.json", "r") as f:
+    genes = json.load(f)
 # %%
