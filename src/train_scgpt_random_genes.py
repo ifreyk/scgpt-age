@@ -361,8 +361,6 @@ def binning(
         bins = np.quantile(row, np.linspace(0, 1, n_bins - 1))
         binned_row = _digitize(row, bins)
     return torch.from_numpy(binned_row) if not return_np else binned_row.astype(dtype)
-
-
 # %%
 hyperparameter_defaults = dict(
     seed=0,
@@ -504,11 +502,11 @@ logger = scg.logger
 scg.utils.add_file_handler(logger, save_dir / "run.log")
     
 #%%
-adata_train = sc.read_h5ad("src/data/train_data_subsampled_cells_genes.h5ad.gz")
-adata_test = sc.read_h5ad("src/data/test_data_subsampled_cells_genes.h5ad.gz")
+adata_train = sc.read_h5ad(AGEANNO_ADATA_TRAIN)
+adata_test = sc.read_h5ad(AGEANNO_ADATA_TEST)
 #%%
 np.random.seed(0)
-genes = np.random.choice(adata_train.var["gene_name"], size=2000, replace=False)
+genes = np.random.choice(adata_train.var["gene_name"], size=3000, replace=False)
 #%%
 adata_train = adata_train[:, genes]
 adata_test = adata_test[:, genes]
@@ -1218,200 +1216,3 @@ for epoch in tqdm(range(1, epochs + 1)):
         scheduler_E.step()
 #%%
 torch.save(best_model.state_dict(), save_dir / "model.pt")
-# %%
-def prepare_data_for_eval(adata_test):
-    all_counts = (
-        adata_test.layers["X_binned"].A
-        if issparse(adata_test.layers["X_binned"])
-        else adata_test.layers["X_binned"]
-    )
-
-    age_labels = adata_test.obs["age_id"].tolist()  # make sure count from 0
-    age_labels = np.array(age_labels)
-
-    batch_ids = adata_test.obs["batch_id"].tolist()
-    batch_ids = np.array(batch_ids)
-
-    tokenized_test = tokenize_and_pad_batch(
-        all_counts,
-        gene_ids,
-        max_len=max_seq_len,
-        vocab=vocab,
-        pad_token=pad_token,
-        pad_value=pad_value,
-        append_cls=True,  # append <cls> token at the beginning
-        include_zero_gene=True,
-    )
-
-    input_values_test = random_mask_value(
-        tokenized_test["values"],
-        mask_ratio=mask_ratio,
-        mask_value=mask_value,
-        pad_value=pad_value,
-    )
-
-    test_data_pt = {
-        "gene_ids": tokenized_test["genes"],
-        "values": input_values_test,
-        "target_values": tokenized_test["values"],
-        "batch_labels": torch.from_numpy(batch_ids).long(),
-        "age_labels": torch.from_numpy(age_labels).long(),
-    }
-
-    test_loader = DataLoader(
-        dataset=SeqDataset(test_data_pt),
-        batch_size=eval_batch_size,
-        shuffle=False,
-        drop_last=False,
-    )
-    return test_loader
-
-
-# %%
-def get_preds_and_probas(model: nn.Module, loader: DataLoader) -> float:
-    """
-    Evaluate the model on the evaluation data.
-    """
-    soft = nn.Softmax()
-    predictions = []
-    probas_all = []
-    with torch.inference_mode():
-        for batch_data in tqdm(loader):
-            input_gene_ids = batch_data["gene_ids"].to(device)
-            input_values = batch_data["values"].to(device)
-            target_values = batch_data["target_values"].to(device)
-            batch_labels = batch_data["batch_labels"].to(device)
-            age_labels = batch_data["age_labels"].to(device)
-
-            src_key_padding_mask = input_gene_ids.eq(vocab[pad_token])
-            with torch.cuda.amp.autocast(enabled=config["amp"]):
-                output_dict = model(
-                    input_gene_ids,
-                    input_values,
-                    src_key_padding_mask=src_key_padding_mask,
-                    batch_labels=(
-                        batch_labels if INPUT_BATCH_LABELS or config["DSBN"] else None
-                    ),
-                    CLS=CLS,  # evaluation does not need CLS or CCE
-                    CCE=False,
-                    MVC=False,
-                    ECS=False,
-                    do_sample=do_sample_in_train,
-                    # generative_training = False,
-                )
-                output_values = output_dict["cls_output"]
-
-            preds = output_values.argmax(1).cpu().numpy()
-            predictions.append(preds)
-            probas_all.append(soft(output_values).detach().cpu().numpy()[:, 1])
-    predictions_result = np.concatenate(predictions, axis=0)
-    preds_all_result = np.concatenate(probas_all, axis=0)
-    return predictions_result, preds_all_result
-#%%
-RUN_ID = 'gene_1'
-
-model.eval()
-predictions, probas = get_preds_and_probas(
-    model,
-    loader=prepare_data_for_eval(adata_test),
-)
-#%%
-adata_train.write_h5ad("src/data/test_data_subsampled_cells_genes_scGPT_gene_1.h5ad.gz",compression='gzip')
-
-#%%
-predictions, probas = get_preds_and_probas(
-    model,
-    loader=prepare_data_for_eval(adata_train),
-)
-adata_train.obs["scGPT_gene_1_predictions"] = predictions
-adata_train.obs["scGPT_gene_1_probas"] = probas
-#%%
-# %%
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-age_labels = adata_test.obs["age_id"].tolist()
-accuracy = accuracy_score(age_labels, predictions)
-precision = precision_score(age_labels, predictions, average="macro")
-recall = recall_score(age_labels, predictions, average="macro")
-macro_f1 = f1_score(age_labels, predictions, average="macro")
-
-logger.info(
-    f"Accuracy: {accuracy:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}, "
-    f"Macro F1: {macro_f1:.3f}"
-)
-
-results = {
-    "test/accuracy": accuracy,
-    "test/precision": precision,
-    "test/recall": recall,
-    "test/macro_f1": macro_f1,
-}
-# %%
-
-# %%
-def _get_dense_layer_matrix(adata: AnnData, preferred_layers: List[str]) -> np.ndarray:
-    for layer_name in preferred_layers:
-        if layer_name == "X" and hasattr(adata, "X") and adata.X is not None:
-            mat = adata.X
-        elif layer_name in adata.layers:
-            mat = adata.layers[layer_name]
-        else:
-            continue
-        return mat.A if issparse(mat) else np.asarray(mat)
-    raise ValueError("No suitable matrix found in preferred layers: " + ",".join(preferred_layers))
-
-
-def run_linear_baseline_ridge() -> Dict[str, float]:
-    X_train = _get_dense_layer_matrix(adata_train, ["X_log1p", "X_normed", "X_binned", "X"]).astype(np.float32)
-    X_test = _get_dense_layer_matrix(adata_test, ["X_log1p", "X_normed", "X_binned", "X"]).astype(np.float32)
-    y_train = np.asarray(adata_train.obs["age_id"], dtype=np.float32)
-    y_test = np.asarray(adata_test.obs["age_id"], dtype=np.int64)
-
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("ridge", Ridge(alpha=1.0, random_state=0)),
-    ])
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-
-    # Metrics (regression + classification on rounded predictions)
-    r2 = r2_score(y_test, y_pred)
-    mae = mean_absolute_error(y_test, y_pred)
-    y_pred_round = np.clip(np.rint(y_pred), y_test.min(), y_test.max()).astype(int)
-    acc_rounded = (y_pred_round == y_test).mean()
-    acc = accuracy_score(y_test, y_pred_round)
-    precision = precision_score(y_test, y_pred_round, average="macro")
-    recall = recall_score(y_test, y_pred_round, average="macro")
-    macro_f1 = f1_score(y_test, y_pred_round, average="macro")
-
-    # Save predictions
-    adata_test.obs["baseline_ridge_age_pred"] = y_pred
-    adata_test.obs["baseline_ridge_age_pred_rounded"] = y_pred_round
-
-    logger.info(
-        f"Baseline Ridge — R2: {r2:.4f}, MAE: {mae:.4f}, Rounded Acc: {acc_rounded:.4f}, "
-        f"Acc: {acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, Macro F1: {macro_f1:.4f}"
-    )
-
-    return {
-        "baseline/r2": r2,
-        "baseline/mae": mae,
-        "baseline/acc_rounded": float(acc_rounded),
-        "baseline/accuracy": float(acc),
-        "baseline/precision": float(precision),
-        "baseline/recall": float(recall),
-        "baseline/macro_f1": float(macro_f1),
-    }
-
-
-# Run baseline after main model evaluation
-baseline_results = run_linear_baseline_ridge()
-
-# %%
-# Save selected genes to JSON for reproducibility
-genes_list = [str(g) for g in list(genes)]
-with open(save_dir / "genes.json", "w") as f:
-    json.dump(genes_list, f)
-# %%
-with open("save/dev_AgeAnno_finall-Oct30-13-50/genes.json", "r") as f:
-    genes = json.load(f)
-# %%
