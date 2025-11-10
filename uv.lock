@@ -2608,6 +2608,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anndata" },
+    { name = "einops" },
     { name = "flash-attn" },
     { name = "jax" },
     { name = "jaxlib" },
@@ -2630,7 +2631,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "anndata", specifier = ">=0.10.9" },
-    { name = "flash-attn", specifier = "<1.0.5" },
+    { name = "einops", specifier = ">=0.8.0" },
+    { name = "flash-attn", specifier = "==1.0.4" },
     { name = "jax", specifier = ">=0.4.25,<0.5.0" },
     { name = "jaxlib", specifier = ">=0.4.25,<0.5.0" },
     { name = "mudata", specifier = ">=0.3.2" },
@@ -2644,7 +2646,7 @@ requires-dist = [
     { name = "scipy", specifier = "==1.13.0" },
     { name = "scvi-tools", specifier = ">=0.20.0,<1.0.0" },
     { name = "setuptools", specifier = ">=80.9.0" },
-    { name = "torch", specifier = ">=2.0.0" },
+    { name = "torch", specifier = ">=2.0.0,<2.2.0" },
     { name = "torchtext", specifier = "==0.16.2" },
     { name = "wandb", specifier = ">=0.22.3" },
 ]

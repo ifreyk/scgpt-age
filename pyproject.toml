@@ -5,14 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "flash-attn<1.0.5",
+    "flash-attn==1.0.4",  # Pinned: must be rebuilt if PyTorch is updated
+    "einops>=0.8.0",  # Required by flash-attn
     "ninja>=1.13.0",
     "packaging>=25.0",
     "psutil>=7.1.2",
     "scgpt>=0.2.4",
-    "scvi-tools>=0.20.0,<1.0.0", # Fixed: compatible version range
+    "scvi-tools>=0.20.0,<1.0.0",  # Fixed: compatible version range
     "setuptools>=80.9.0",
-    "torch>=2.0.0", # Lowered: 2.9.0 might be too new
+    "torch>=2.0.0,<2.2.0",  # Tested with 2.1.2+cu121; flash-attn must be rebuilt if updated
     "jax>=0.4.25,<0.5.0",
     "jaxlib>=0.4.25,<0.5.0",
     "torchtext==0.16.2",
@@ -29,6 +30,8 @@ dependencies = [
 requires = ["setuptools", "wheel", "torch>=2.0.0"]
 build-backend = "setuptools.build_meta"
 
-# Add this section to fix flash-attn build dependency
+# Build dependencies for flash-attn
+# Note: flash-attn must be rebuilt from source if PyTorch version changes
+# Install with: pip install flash-attn==1.0.4 --no-build-isolation
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]

@@ -34,7 +34,7 @@ Aging is a progressive functional decline driven by complex genetic, epigenetic,
 
 The analysis uses the **AgeAnno dataset** comprising scRNA-seq data from 13 human tissues across donors aged 20-100 years. Key preprocessing steps include:
 
-- Log-normalization of raw count matrices
+- Binned-normalization of raw count matrices
 - Exclusion of genes expressed in <1% of cells
 - Removal of mitochondrial, ribosomal, and hemoglobin genes
 - Subsampling to 3,000 age-associated genes due to computational constraints
@@ -71,9 +71,10 @@ The analysis uses the **AgeAnno dataset** comprising scRNA-seq data from 13 huma
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
-- PyTorch 1.12+
-- CUDA-compatible GPU (recommended: NVIDIA RTX 4090 with 24GB memory)
+- Python 3.11+
+- PyTorch 2.0.0 - 2.2.0 (tested with 2.1.2+cu121)
+- CUDA-compatible GPU (recommended: NVIDIA H200 with 140GB memory)
+- UV package manager (for dependency management)
 
 ### Dependencies
 ```bash
@@ -118,6 +119,12 @@ Alternative training approach using randomly selected genes for comparison and r
 python src/perturbation_analysis.py
 ```
 Performs systematic *in silico* gene perturbations to identify pro- and anti-aging genes. This script automatically loads the trained model and performs the perturbation analysis.
+
+### 4. Extended Perturbation Analysis (Optional)
+```bash
+python src/perturbation_analysis_extend.py
+```
+Extended version of the perturbation analysis with additional features and configurations.
 
 ## Project Structure
 

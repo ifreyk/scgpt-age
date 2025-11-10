@@ -1,3 +1,4 @@
+#%%
 import copy
 import gc
 import json
@@ -31,6 +32,8 @@ from torchtext._torchtext import (
 )
 from scipy.sparse import hstack, csr_matrix
 from sklearn.metrics import confusion_matrix
+from scipy.stats import mannwhitneyu
+import statsmodels.stats.multitest as smm
 
 sys.path.insert(0, "../")
 import scgpt as scg
@@ -484,9 +487,9 @@ DAB_separate_optim = True if DAB > 1 else False
 filter_gene_by_counts = False
 data_is_raw = False
 
-adata_test = sc.read_h5ad("data/final/test_data.h5ad.gz")
+adata_test = sc.read_h5ad("src/data/test_data.h5ad.gz")
 if config.load_model is not None:
-    model_dir = Path('models/scGPT_Age')
+    model_dir = Path('src/data/models/scGPT_best_age')
     model_config_file = model_dir / "args.json"
     model_file = model_dir / "best_model.pt"
     vocab_file = model_dir / "vocab.json"
@@ -665,7 +668,7 @@ test_loader = DataLoader(
         shuffle=False,
         drop_last=False,
 )
-
+#%%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ntokens = len(vocab)  # size of vocabulary
@@ -881,21 +884,7 @@ def model_predict(model,adata,gene_ids):
     )
     return {'predictions':predictions,
             'probas':probas}
-    
-adata_subsets = []
-for tissue in tqdm(adata_test.obs['tissue'].unique()):
-    temp_adata = adata_test[adata_test.obs['tissue']==tissue]
-    smlpd_adata = sc.pp.subsample(temp_adata,fraction='tissue',random_state=0,
-                                  n_obs=100,copy=True)
-    adata_subsets.append(smlpd_adata)
-    
-subsampled_adata = sc.concat(adata_subsets)
-
-raw_df = pd.DataFrame({'cells':subsampled_adata.obs.index,
-                       'tissue':subsampled_adata.obs['tissue'],
-                       'age_category':subsampled_adata.obs['age_category'],
-                       'age_id':subsampled_adata.obs['age_id']})
-
+#%%
 def create_synt_adata(adata,gene,fill_max=True):
     if fill_max:
         new_gene_expression = np.full((adata.n_obs,),10000)
@@ -903,7 +892,6 @@ def create_synt_adata(adata,gene,fill_max=True):
         new_gene_expression = np.full((adata.n_obs,),0)
     adata_test_genes = adata.copy()
     new_var = pd.DataFrame(index=[gene])
-
 
     for col in adata_test_genes.var.columns:
         new_var[col] = np.nan
@@ -916,28 +904,78 @@ def create_synt_adata(adata,gene,fill_max=True):
     adata_test_genes_new = sc.AnnData(X=adata_test_genes_X,obs=adata_test_genes.obs,var=adata_test_genes_var)
     return adata_test_genes_new
 
-for gene_idx,gene_name in tqdm(enumerate(adata_test_genes.var_names)):
-    adata_test_genes = subsampled_adata.copy()
-    try:
-        adata_high = create_synt_adata(adata_test_genes,gene=gene_name,fill_max=True)
-        adata_low = create_synt_adata(adata_test_genes,gene=gene_name,fill_max=False)
+# Run perturbation analysis 4 times with different cell subsets
+n_runs = 4
+all_raw_dfs = []
+
+for run_idx in range(n_runs):
+    logger.info(f"Starting run {run_idx + 1}/{n_runs} with random_state={run_idx}")
+    
+    # Create different subset for each run using different random_state
+    adata_subsets = []
+    for tissue in tqdm(adata_test.obs['tissue'].unique(), desc=f"Run {run_idx + 1}: Sampling cells"):
+        temp_adata = adata_test[adata_test.obs['tissue']==tissue]
+        # Sample 100 cells per tissue (or all cells if tissue has fewer than 100)
+        n_cells_to_sample = min(100, temp_adata.n_obs)
+        if n_cells_to_sample < temp_adata.n_obs:
+            smlpd_adata = sc.pp.subsample(temp_adata, n_obs=n_cells_to_sample, random_state=run_idx, copy=True)
+        else:
+            # If tissue has <= 100 cells, use all of them
+            smlpd_adata = temp_adata.copy()
+        adata_subsets.append(smlpd_adata)
+    
+    subsampled_adata = sc.concat(adata_subsets)
+    
+    raw_df = pd.DataFrame({
+        'cells': subsampled_adata.obs['index'],
+        'tissue': subsampled_adata.obs['tissue'],
+        'age_category': subsampled_adata.obs['age_category'],
+        'age_id': subsampled_adata.obs['age_id'],
+        'run_id': run_idx  # Track which run this data comes from
+    })
+    
+    # Run perturbation analysis for this subset
+    logger.info(f"Run {run_idx + 1}: Processing {len(subsampled_adata.var_names)} genes")
+    for gene_idx, gene_name in tqdm(enumerate(subsampled_adata.var_names), 
+                                       desc=f"Run {run_idx + 1}: Genes",
+                                       total=len(subsampled_adata.var_names)):
+        adata_test_genes = subsampled_adata.copy()
+        try:
+            adata_high = create_synt_adata(adata_test_genes, gene=gene_name, fill_max=True)
+            adata_low = create_synt_adata(adata_test_genes, gene=gene_name, fill_max=False)
+            
+            gene_ids = np.array(vocab(adata_high.var_names.tolist()), dtype=int)
+            
+            result_high = model_predict(model, adata_high, gene_ids)
+            result_low = model_predict(model, adata_low, gene_ids)
+            
+            high_mean_result = result_high['probas'].mean()
+            low_mean_result = result_low['probas'].mean()
+            
+            raw_df[f'{gene_name}_high'] = result_high['probas']
+            raw_df[f'{gene_name}_low'] = result_low['probas']
+            
+            if gene_idx % 50 == 0:
+                logger.info(f'Run {run_idx + 1}: {gene_name} - High mean: {high_mean_result:.4f}, Low mean: {low_mean_result:.4f}')
+        except Exception as e:
+            logger.warning(f"Run {run_idx + 1}: Error processing {gene_name}: {e}")
+            raw_df[f'{gene_name}_high'] = np.nan
+            raw_df[f'{gene_name}_low'] = np.nan
         
-        gene_ids = np.array(vocab(adata_high.var_names.tolist()), dtype=int)
-        
-        result_high = model_predict(model,adata_high,gene_ids)
-        result_low = model_predict(model,adata_low,gene_ids)
-        
-        high_mean_result = result_high['probas'].mean()
-        low_mean_result = result_low['probas'].mean()
-        
-        raw_df[f'{gene_name}_high'] = result_high['probas']
-        raw_df[f'{gene_name}_low'] = result_low['probas']
-        
-        print(f'High mean expr for {gene_name}: {high_mean_result}')
-        print(f'Low mean expr for {gene_name}: {low_mean_result}')
-    except Exception:
-        raw_df[f'{gene_name}_high'] = np.nan
-        raw_df[f'{gene_name}_low'] = np.nan
-    if gene_idx%50==0:
-        os.makedirs('data', exist_ok=True)
-        raw_df.to_csv('data/gene_results.csv')
+        # Save intermediate results every 50 genes
+        if gene_idx % 50 == 0:
+            os.makedirs('data', exist_ok=True)
+            raw_df.to_csv(f'data/gene_results_run{run_idx + 1}.csv', index=False)
+    
+    # Save final results for this run
+    os.makedirs('data', exist_ok=True)
+    raw_df.to_csv(f'data/gene_results_run{run_idx + 1}.csv', index=False)
+    all_raw_dfs.append(raw_df)
+    logger.info(f"Run {run_idx + 1} completed. Saved to data/gene_results_run{run_idx + 1}.csv")
+
+# Combine all runs into a single dataframe (optional)
+if len(all_raw_dfs) > 0:
+    combined_df = pd.concat(all_raw_dfs, ignore_index=True)
+    os.makedirs('data', exist_ok=True)
+    combined_df.to_csv('data/gene_results_all_runs.csv', index=False)
+    logger.info(f"Combined all {n_runs} runs. Total rows: {len(combined_df)}. Saved to data/gene_results_all_runs.csv")

@@ -364,7 +364,7 @@ hyperparameter_defaults = dict(
     seed=0,
     dataset_name="AgeAnno_finall",
     do_train=True,
-    load_model="models/scGPT_Age",
+    load_model="src/data/models/scGPT_human",
     mask_ratio=0.0,
     epochs=10,
     n_bins=51,
@@ -372,7 +372,7 @@ hyperparameter_defaults = dict(
     ecs_thres=0.0,  # Elastic cell similarity objective, 0.0 to 1.0, 0.0 to disable
     dab_weight=0.0,
     lr=1e-4,
-    batch_size=32,  # TODO надо поменять
+    batch_size=128,  # TODO надо поменять
     layer_size=128,
     nlayers=4,  # number of nn.TransformerEncoderLayer in nn.TransformerEncoder
     nhead=4,  # number of heads in nn.MultiheadAttention
@@ -1191,3 +1191,4 @@ for epoch in tqdm(range(1, epochs + 1)):
         scheduler_E.step()
         
 torch.save(best_model.state_dict(), save_dir / "best_model.pt")
+# %%
