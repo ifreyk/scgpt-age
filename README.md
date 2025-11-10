@@ -46,7 +46,7 @@ The analysis uses the **AgeAnno dataset** comprising scRNA-seq data from 13 huma
 - **Hyperparameters**:
   - Epochs: 10
   - Learning rate: 1×10⁻⁴
-  - Batch size: 10
+  - Batch size: 128
   - Hidden layer size: 128
   - Transformer layers: 4
   - Attention heads: 4
