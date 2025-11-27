@@ -41,7 +41,7 @@ save/**
 !save/.gitkeep
 models/**
 !models/.gitkeep
-
+/wandb
 # Large outputs
 *.h5ad
 *.h5ad.gz

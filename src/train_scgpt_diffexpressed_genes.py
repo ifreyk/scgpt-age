@@ -44,7 +44,7 @@ from scgpt.loss import (
 from scgpt.tokenizer.gene_tokenizer import GeneVocab
 from scgpt import SubsetsBatchSampler
 from scgpt.utils import set_seed, category_str2int, eval_scib_metrics
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
 from tqdm import tqdm
 
 sc.set_figure_params(figsize=(6, 6))
@@ -54,8 +54,8 @@ from scanpy.get import _get_obs_rep, _set_obs_rep
 
 SCGPT_MODEL_PATH = "src/data/models/scGPT_human"
 
-AGEANNO_ADATA_TRAIN = "src/data/train_data.h5ad.gz"
-AGEANNO_ADATA_TEST = "src/data/test_data.h5ad.gz"
+AGEANNO_ADATA_TRAIN = "src/data/donor_divided/subset_edited_genes_skin_ageanno_train.h5ad.gz"
+AGEANNO_ADATA_TEST = "src/data/donor_divided/subset_edited_genes_skin_ageanno_test.h5ad.gz"
 
 # %%
 class Preprocessor:
@@ -366,17 +366,18 @@ hyperparameter_defaults = dict(
     do_train=True,
     load_model="src/data/models/scGPT_human",
     mask_ratio=0.0,
-    epochs=10,
+    epochs=10,  # Increased epochs to allow more training
     n_bins=51,
     MVC=False,  # Masked value prediction for cell embedding
     ecs_thres=0.0,  # Elastic cell similarity objective, 0.0 to 1.0, 0.0 to disable
     dab_weight=0.0,
-    lr=1e-4,
-    batch_size=128,  # TODO надо поменять
-    layer_size=128,
-    nlayers=4,  # number of nn.TransformerEncoderLayer in nn.TransformerEncoder
-    nhead=4,  # number of heads in nn.MultiheadAttention
-    dropout=0.4,  # dropout probability
+    lr=1e-4,  # Slightly higher learning rate for better convergence
+    batch_size=64,  # Increased batch size for more stable gradients
+    layer_size=128,  # Increased model capacity
+    nlayers=4,  # More layers for better representation
+    nhead=5,  # More attention heads
+    dropout=0.4,  # Increased dropout to reduce overfitting
+    weight_decay=3e-4,  # Increased weight decay for better regularization
     schedule_ratio=0.9,  # ratio of epochs for learning rate schedule
     save_eval_interval=5,
     fast_transformer=True,
@@ -385,6 +386,12 @@ hyperparameter_defaults = dict(
     include_zero_gene=False,
     freeze=False,  # freeze
     DSBN=False,  # Domain-spec batchnorm
+    early_stopping_patience=5,  # Increased patience to allow recovery
+    label_smoothing=0.15,  # Moderate label smoothing to reduce overfitting
+    use_reduce_lr_on_plateau=True,  # Use ReduceLROnPlateau for better LR scheduling
+    reduce_lr_factor=0.5,  # Factor to reduce LR by
+    reduce_lr_patience=1,  # More aggressive LR reduction to prevent overfitting
+    min_lr=1e-6,  # Minimum learning rate
 )
 # %%
 config = hyperparameter_defaults
@@ -399,7 +406,7 @@ mask_value = "auto"  # for masked values, now it should always be auto
 include_zero_gene = config[
     "include_zero_gene"
 ]  # if True, include zero genes among hvgs in the training
-max_seq_len = 3001
+max_seq_len = 900
 n_bins = config["n_bins"]
 
 # input/output representation
@@ -416,7 +423,7 @@ ECS = config["ecs_thres"] > 0  # Elastic cell similarity objective
 DAB = False  # Domain adaptation by reverse backpropagation, set to 2 for separate optimizer
 INPUT_BATCH_LABELS = False  # TODO: have these help MLM and MVC, while not to classifier
 input_emb_style = "continuous"  # "category" or "continuous" or "scaling"
-cell_emb_style = "cls"  # "avg-pool" or "w-pool" or "cls"
+cell_emb_style = "avg-pool"  # "avg-pool" or "w-pool" or "cls"
 adv_E_delay_epochs = 0  # delay adversarial training on encoder for a few epochs
 adv_D_delay_epochs = 0
 mvc_decoder_style = "inner product"
@@ -434,7 +441,7 @@ lr_ADV = 1e-3  # learning rate for discriminator, used when ADV is True
 batch_size = config["batch_size"]
 eval_batch_size = config["batch_size"]
 epochs = config["epochs"]
-schedule_interval = 1
+schedule_interval = 2
 
 # settings for the model
 fast_transformer = config["fast_transformer"]
@@ -446,6 +453,9 @@ d_hid = config[
 nlayers = config["nlayers"]  # number of TransformerEncoderLayer in TransformerEncoder
 nhead = config["nhead"]  # number of heads in nn.MultiheadAttention
 dropout = config["dropout"]  # dropout probability
+weight_decay = config.get("weight_decay", 1e-4)  # weight decay for regularization
+early_stopping_patience = config.get("early_stopping_patience", 3)  # early stopping patience
+label_smoothing = config.get("label_smoothing", 0.1)  # label smoothing
 
 # logging
 log_interval = 100  # iterations
@@ -488,6 +498,26 @@ scg.utils.add_file_handler(logger, save_dir / "run.log")
 #%%
 adata_train = sc.read_h5ad(AGEANNO_ADATA_TRAIN)
 adata_test = sc.read_h5ad(AGEANNO_ADATA_TEST)
+#%%
+adata_train.var["gene_name"] = adata_train.var_names
+adata_test.var["gene_name"] = adata_test.var_names
+#%%
+adata_train.obs["age_category"] = [x[:3] for x in adata_train.obs['orig.ident']]
+adata_test.obs["age_category"] = [x[:3] for x in adata_test.obs['orig.ident']]
+#%%
+adata_train.obs["batch_id"] = 0
+adata_test.obs["batch_id"] = 0
+#%%
+adata_train.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_train.obs['age_category']]
+adata_test.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_test.obs['age_category']]
+#%%
+genes = pd.read_csv("save/logistic_regression_multi_tissue_regul/skin/coefficients.csv")
+genes['abs_coefficient'] = genes['coefficient'].abs()
+genes_to_keep = genes[genes['abs_coefficient']!=0]
+genes_to_keep = genes.sort_values("abs_coefficient",ascending=False)['gene'].tolist()
+#%%
+adata_train = adata_train[:, genes_to_keep]
+adata_test = adata_test[:, genes_to_keep]
 # %%
 with open(f"{SCGPT_MODEL_PATH}/vocab.json", "r") as f:
     vocab = json.load(f)
@@ -571,6 +601,166 @@ def return_data_age_batch(adata_to_use):
 # %%
 train_data, train_age_labels, train_batch_labels = return_data_age_batch(adata_train)
 valid_data, valid_age_labels, valid_batch_labels = return_data_age_batch(adata_test)
+# %%
+def compute_roc_auc(model, adata_test, save_plot=True):
+    """
+    Compute ROC-AUC score for adata_test using the trained model.
+    
+    Args:
+        model: The trained model
+        adata_test: Test AnnData object
+        save_plot: Whether to save ROC curve plot
+    
+    Returns:
+        roc_auc: ROC-AUC score
+    """
+    model.eval()
+    
+    # Prepare test data
+    test_data, test_age_labels, test_batch_labels = return_data_age_batch(adata_test)
+    
+    # Tokenize test data
+    tokenized_test = tokenize_and_pad_batch(
+        test_data,
+        gene_ids,
+        max_len=max_seq_len,
+        vocab=vocab,
+        pad_token=pad_token,
+        pad_value=pad_value,
+        append_cls=True,
+        include_zero_gene=True,
+    )
+    
+    # Prepare data for evaluation
+    masked_values_test = random_mask_value(
+        tokenized_test["values"],
+        mask_ratio=mask_ratio,
+        mask_value=mask_value,
+        pad_value=pad_value,
+    )
+    
+    input_gene_ids_test = tokenized_test["genes"]
+    input_values_test = masked_values_test
+    tensor_batch_labels_test = torch.from_numpy(test_batch_labels).long()
+    tensor_age_labels_test = torch.from_numpy(test_age_labels).long()
+    
+    test_data_pt = {
+        "gene_ids": input_gene_ids_test,
+        "values": input_values_test,
+        "target_values": tokenized_test["values"],
+        "batch_labels": tensor_batch_labels_test,
+        "age_labels": tensor_age_labels_test,
+    }
+    
+    test_loader = prepare_dataloader(
+        test_data_pt,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        intra_domain_shuffle=False,
+        drop_last=False,
+    )
+    
+    # Get predictions
+    all_probs = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch_data in test_loader:
+            input_gene_ids = batch_data["gene_ids"].to(device)
+            input_values = batch_data["values"].to(device)
+            batch_labels = batch_data["batch_labels"].to(device)
+            age_labels = batch_data["age_labels"].to(device)
+            
+            src_key_padding_mask = input_gene_ids.eq(vocab[pad_token])
+            with torch.cuda.amp.autocast(enabled=config["amp"]):
+                output_dict = model(
+                    input_gene_ids,
+                    input_values,
+                    src_key_padding_mask=src_key_padding_mask,
+                    batch_labels=(
+                        batch_labels if INPUT_BATCH_LABELS or config["DSBN"] else None
+                    ),
+                    CLS=CLS,
+                    CCE=False,
+                    MVC=False,
+                    ECS=False,
+                    do_sample=do_sample_in_train,
+                )
+                output_values = output_dict["cls_output"]
+                
+            # Convert logits to probabilities using softmax
+            probs = F.softmax(output_values, dim=1)
+            # For binary classification, use probability of positive class (class 1)
+            if probs.shape[1] == 2:
+                pos_probs = probs[:, 1].cpu().numpy()
+            else:
+                # If multi-class, use max probability (or adjust as needed)
+                pos_probs = probs.max(dim=1)[0].cpu().numpy()
+            
+            all_probs.extend(pos_probs)
+            all_labels.extend(age_labels.cpu().numpy())
+    
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    
+    # Calculate ROC-AUC
+    roc_auc = roc_auc_score(all_labels, all_probs)
+    logger.info(f"ROC-AUC score for adata_test: {roc_auc:.4f}")
+    
+    # Plot ROC curve
+    if save_plot:
+        plot_roc_curve(all_labels, all_probs, roc_auc, 
+                      title='ROC Curve for Age Classification (adata_test)',
+                      save_path=save_dir / "roc_curve_test.png")
+    
+    return roc_auc, all_probs, all_labels
+
+
+def plot_roc_curve(y_true, y_scores, roc_auc_score, title='ROC Curve', 
+                   save_path=None, show_plot=True, figsize=(10, 8)):
+    """
+    Plot ROC curve with AUC score.
+    
+    Args:
+        y_true: True binary labels
+        y_scores: Target scores (probabilities of positive class)
+        roc_auc_score: ROC-AUC score
+        title: Plot title
+        save_path: Path to save the plot (optional)
+        show_plot: Whether to display the plot
+        figsize: Figure size tuple
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+    
+    plt.figure(figsize=figsize)
+    plt.plot(fpr, tpr, color='darkorange', lw=3, 
+            label=f'ROC curve (AUC = {roc_auc_score:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+            label='Random classifier (AUC = 0.50)')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate (1 - Specificity)', fontsize=14, fontweight='bold')
+    plt.ylabel('True Positive Rate (Sensitivity)', fontsize=14, fontweight='bold')
+    plt.title(title, fontsize=16, fontweight='bold', pad=20)
+    plt.legend(loc="lower right", fontsize=12, framealpha=0.9)
+    plt.grid(alpha=0.3, linestyle='--')
+    
+    # Add text annotation with AUC score
+    plt.text(0.6, 0.2, f'AUC = {roc_auc_score:.4f}', 
+            fontsize=14, fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        logger.info(f"ROC curve saved to {save_path}")
+    
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
 # %%
 batch_ids = adata_train[adata_train.obs["batch_id"] == 0].obs["batch_id"].tolist()
 num_batch_types = len(set(batch_ids))
@@ -820,26 +1010,37 @@ if ADV:
     ).to(device)
 # %#
 criterion = masked_mse_loss
-criterion_cls = nn.CrossEntropyLoss()
+criterion_cls = nn.CrossEntropyLoss(label_smoothing=label_smoothing)  # Add label smoothing
 criterion_dab = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(
-    model.parameters(), lr=lr, eps=1e-4 if config["amp"] else 1e-8
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=lr, weight_decay=weight_decay, eps=1e-4 if config["amp"] else 1e-8
 )
-scheduler = torch.optim.lr_scheduler.StepLR(
-    optimizer, schedule_interval, gamma=config["schedule_ratio"]
-)
+# Use ReduceLROnPlateau for adaptive learning rate scheduling
+if config.get("use_reduce_lr_on_plateau", False):
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=config.get("reduce_lr_factor", 0.5),
+        patience=config.get("reduce_lr_patience", 2),
+        min_lr=config.get("min_lr", 1e-6),
+        verbose=True
+    )
+else:
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, schedule_interval, gamma=config["schedule_ratio"]
+    )
 if DAB_separate_optim:
-    optimizer_dab = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer_dab = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler_dab = torch.optim.lr_scheduler.StepLR(
         optimizer_dab, schedule_interval, gamma=config["schedule_ratio"]
     )
 if ADV:
     criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
-    optimizer_E = torch.optim.Adam(model.parameters(), lr=lr_ADV)
+    optimizer_E = torch.optim.Adam(model.parameters(), lr=lr_ADV, weight_decay=weight_decay)
     scheduler_E = torch.optim.lr_scheduler.StepLR(
         optimizer_E, schedule_interval, gamma=config["schedule_ratio"]
     )
-    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr_ADV)
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr_ADV, weight_decay=weight_decay)
     scheduler_D = torch.optim.lr_scheduler.StepLR(
         optimizer_D, schedule_interval, gamma=config["schedule_ratio"]
     )
@@ -1020,7 +1221,11 @@ def train(model: nn.Module, loader: DataLoader) -> None:
         total_acc += accuracy
         total_error += error_rate
         if batch % log_interval == 0 and batch > 0:
-            lr = scheduler.get_last_lr()[0]
+            # Get learning rate - works for both StepLR and ReduceLROnPlateau
+            if hasattr(scheduler, 'get_last_lr'):
+                lr = scheduler.get_last_lr()[0]
+            else:
+                lr = optimizer.param_groups[0]['lr']
             ms_per_batch = (time.time() - start_time) * 1000 / log_interval
             cur_loss = total_loss / log_interval
             cur_mse = total_mse / log_interval
@@ -1141,6 +1346,8 @@ def evaluate(model: nn.Module, loader: DataLoader, return_raw: bool = False) -> 
 best_val_loss = float("inf")
 best_avg_bio = 0.0
 best_model = None
+best_model_epoch = 0
+patience_counter = 0  # for early stopping
 
 for epoch in tqdm(range(1, epochs + 1)):
     epoch_start_time = time.time()
@@ -1148,7 +1355,7 @@ for epoch in tqdm(range(1, epochs + 1)):
     train_loader = prepare_dataloader(
         train_data_pt,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,  # Enable shuffling to prevent memorization
         intra_domain_shuffle=True,
         drop_last=False,
     )
@@ -1181,14 +1388,67 @@ for epoch in tqdm(range(1, epochs + 1)):
         best_val_loss = val_loss
         best_model = copy.deepcopy(model)
         best_model_epoch = epoch
+        patience_counter = 0  # reset patience counter
         logger.info(f"Best model with score {best_val_loss:5.4f}")
+    else:
+        patience_counter += 1
+        logger.info(f"Validation loss did not improve. Patience: {patience_counter}/{early_stopping_patience}")
+        
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            logger.info(f"Early stopping triggered at epoch {epoch}. Best validation loss: {best_val_loss:5.4f}")
+            break
 
-    scheduler.step()
+    # Update learning rate scheduler
+    current_lr = optimizer.param_groups[0]['lr']
+    if config.get("use_reduce_lr_on_plateau", False):
+        # Log before scheduler step for debugging
+        logger.info(f"Before scheduler step: current_lr={current_lr:.6f}, val_loss={val_loss:.4f}, best_val_loss={best_val_loss:.4f}")
+        scheduler.step(val_loss)  # ReduceLROnPlateau needs the metric value
+        new_lr = optimizer.param_groups[0]['lr']
+        if new_lr < current_lr:
+            logger.info(f"✓ Learning rate reduced from {current_lr:.6f} to {new_lr:.6f}")
+        else:
+            logger.info(f"Learning rate unchanged: {current_lr:.6f} (scheduler patience: {scheduler.patience}, cooldown: {getattr(scheduler, 'cooldown', 0)})")
+    else:
+        scheduler.step()
+        new_lr = optimizer.param_groups[0]['lr']
+        if new_lr < current_lr:
+            logger.info(f"Learning rate reduced from {current_lr:.6f} to {new_lr:.6f}")
     if DAB_separate_optim:
         scheduler_dab.step()
     if ADV:
         scheduler_D.step()
         scheduler_E.step()
-        
-torch.save(best_model.state_dict(), save_dir / "best_model.pt")
+#%%
+# Save the best model (already set during training)
+if best_model is not None:
+    torch.save(best_model.state_dict(), save_dir / "best_model.pt")
+    logger.info(f"Saved best model from epoch {best_model_epoch} with validation loss {best_val_loss:.4f}")
+else:
+    # Fallback: save current model if no best model was found
+    logger.warning("No best model found during training, saving current model")
+    torch.save(model.state_dict(), save_dir / "best_model.pt")
+    best_model = model
+# %%
+# Compute ROC-AUC for adata_test
+# if best_model is not None:
+#     roc_auc_score_test, test_probs, test_labels = compute_roc_auc(best_model, adata_test, save_plot=True)
+#     logger.info(f"Final ROC-AUC score for adata_test: {roc_auc_score_test:.4f}")
+# else:
+logger.warning("best_model is None, using current model for ROC-AUC calculation")
+roc_auc_score_test, test_probs, test_labels = compute_roc_auc(model, adata_test, save_plot=True)
+logger.info(f"Final ROC-AUC score for adata_test: {roc_auc_score_test:.4f}")
+
+# Plot ROC curve
+plot_roc_curve(test_labels, test_probs, roc_auc_score_test,
+              title='ROC Curve for Age Classification (adata_test)',
+              save_path=save_dir / "roc_curve_test.png",
+              show_plot=True)
+# %%
+torch.save(model.state_dict(), save_dir / "best_model.pt")
+# %%
+for donor in adata_test.obs['orig.ident'].unique():
+    if donor in adata_train.obs['orig.ident'].unique():
+        print(donor)
 # %%

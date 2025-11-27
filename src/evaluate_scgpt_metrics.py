@@ -1,3 +1,8 @@
+# %%
+"""
+Comprehensive evaluation script for scGPT model
+Calculates ROC-AUC, Precision, Recall, and other classification metrics
+"""
 #%%
 import copy
 import gc
@@ -30,10 +35,7 @@ from torchtext.vocab import Vocab
 from torchtext._torchtext import (
     Vocab as VocabPybind,
 )
-from scipy.sparse import hstack, csr_matrix
 from sklearn.metrics import confusion_matrix
-from scipy.stats import mannwhitneyu
-import statsmodels.stats.multitest as smm
 
 sys.path.insert(0, "../")
 import scgpt as scg
@@ -47,6 +49,8 @@ from scgpt.loss import (
 from scgpt.tokenizer.gene_tokenizer import GeneVocab
 #from scgpt.preprocess import Preprocessor
 from scgpt import SubsetsBatchSampler
+from scgpt.utils import set_seed, category_str2int, eval_scib_metrics
+from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 sc.set_figure_params(figsize=(6, 6))
 os.environ["KMP_WARNINGS"] = "off"
@@ -62,7 +66,18 @@ from scanpy.get import _get_obs_rep, _set_obs_rep
 from anndata import AnnData
 
 from scgpt import logger
+from typing import Dict, Optional, Union
+from sklearn.metrics import roc_auc_score
+import re
+import numpy as np
+import torch
+from scipy.sparse import issparse
+import scanpy as sc
+from scanpy.get import _get_obs_rep, _set_obs_rep
+from anndata import AnnData
 
+from scgpt import logger
+#%%
 class Preprocessor:
     """
     Prepare data into training, valid and test split. Normalize raw expression
@@ -356,8 +371,17 @@ def binning(
         bins = np.quantile(row, np.linspace(0, 1, n_bins - 1))
         binned_row = _digitize(row, bins)
     return torch.from_numpy(binned_row) if not return_np else binned_row.astype(dtype)
+#%%
+sc.set_figure_params(figsize=(6, 6))
+os.environ["KMP_WARNINGS"] = "off"
+warnings.filterwarnings("ignore")
+
+# Configuration
+SCGPT_MODEL_PATH = "src/data/models/scGPT_best_age_diff"
+AGEANNO_ADATA_TEST = "src/data/subset_edited_genes_ageanno_test.h5ad.gz"
 
 
+# %%
 hyperparameter_defaults = dict(
     seed=0,
     dataset_name="valid_diff",
@@ -384,7 +408,7 @@ hyperparameter_defaults = dict(
     freeze = False, #freeze
     DSBN = False  # Domain-spec batchnorm
 )
-
+# %%
 run = wandb.init(
     config=hyperparameter_defaults,
     project="scGPT",
@@ -393,14 +417,14 @@ run = wandb.init(
 )
 config = wandb.config
 print(config)
-
+# %%
 dataset_name = config.dataset_name
 save_dir = Path(f"save/dev_{dataset_name}-{time.strftime('%b%d-%H-%M')}/")
 save_dir.mkdir(parents=True, exist_ok=True)
 print(f"save to {save_dir}")
 logger = scg.logger
 scg.utils.add_file_handler(logger, save_dir / "run.log")
-
+# %%
 # settings for input and preprocessing
 pad_token = "<pad>"
 special_tokens = [pad_token, "<cls>", "<eoc>"]
@@ -458,7 +482,7 @@ dropout = config.dropout  # dropout probability
 log_interval = 100  # iterations
 save_eval_interval = config.save_eval_interval  # epochs
 do_eval_scib_metrics = True
-
+# %%
 # %% validate settings
 assert input_style in ["normed_raw", "log1p", "binned"]
 assert output_style in ["normed_raw", "log1p", "binned"]
@@ -486,8 +510,9 @@ if ADV and DAB:
 DAB_separate_optim = True if DAB > 1 else False
 filter_gene_by_counts = False
 data_is_raw = False
-
+# %%
 adata_test = sc.read_h5ad("src/data/subset_edited_genes_ageanno_test.h5ad.gz")
+#%%
 adata_test.var["gene_name"] = adata_test.var_names
 #%%
 adata_test.obs["age_category"] = [x[:3] for x in adata_test.obs['orig.ident']]
@@ -495,6 +520,7 @@ adata_test.obs["age_category"] = [x[:3] for x in adata_test.obs['orig.ident']]
 adata_test.obs["batch_id"] = 0
 #%%
 adata_test.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_test.obs['age_category']]
+# %%
 if config.load_model is not None:
     model_dir = Path('src/data/models/scGPT_best_age_diff')
     model_config_file = model_dir / "args.json"
@@ -529,8 +555,8 @@ if config.load_model is not None:
     d_hid = model_configs["d_hid"]
     nlayers = model_configs["nlayers"]
     n_layers_cls = model_configs["n_layers_cls"]
-    
-    # set up the preprocessor, use the args to config the workflow
+# %%
+# set up the preprocessor, use the args to config the workflow
 preprocessor = Preprocessor(
     use_key="X",  # the key in adata.layers to use as raw data
     filter_gene_by_counts=filter_gene_by_counts,  # step 1
@@ -547,7 +573,7 @@ preprocessor = Preprocessor(
 
 
 preprocessor(adata_test, batch_key=None)
-
+# %%
 input_layer_key = {  # the values of this map coorespond to the keys in preprocessing
     "normed_raw": "X_normed",
     "log1p": "X_normed",
@@ -566,16 +592,16 @@ age_labels = np.array(age_labels)
 batch_ids = adata_test.obs["batch_id"].tolist()
 num_batch_types = len(set(batch_ids))
 batch_ids = np.array(batch_ids)
-
+# %%
 num_types = len(adata_test.obs["age_category"].unique())
-
+# %%
 if config.load_model is None:
     vocab = Vocab(
         VocabPybind(genes + special_tokens, None)
     )  # bidirectional lookup [gene <-> int]
 vocab.set_default_index(vocab["<pad>"])
 gene_ids = np.array(vocab(genes), dtype=int)
-
+# %%
 class SeqDataset(Dataset):
     def __init__(self, data: Dict[str, torch.Tensor]):
         self.data = data
@@ -630,7 +656,7 @@ def prepare_dataloader(
         pin_memory=True,
     )
     return data_loader
-
+# %%
 all_counts = (
         adata_test.layers[input_layer_key].A
         if issparse(adata_test.layers[input_layer_key])
@@ -675,7 +701,7 @@ test_loader = DataLoader(
         shuffle=False,
         drop_last=False,
 )
-#%%
+# %%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ntokens = len(vocab)  # size of vocabulary
@@ -754,8 +780,7 @@ if ADV:
         d_model=embsize,
         n_cls=num_batch_types,
     ).to(device)
-    
-    
+# %%
 criterion = masked_mse_loss
 criterion_cls = nn.CrossEntropyLoss()
 criterion_dab = nn.CrossEntropyLoss()
@@ -782,13 +807,40 @@ if ADV:
     )
 
 scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
-def get_preds_and_probas(model: nn.Module, loader: DataLoader) -> float:
+# %%
+def return_data_age_batch(adata_to_use):
+    input_layer_key = {  # the values of this map coorespond to the keys in preprocessing
+    "normed_raw": "X_normed",
+    "log1p": "X_normed",
+    "binned": "X_binned",
+    }[input_style]
+    all_counts = (
+        adata_to_use.layers[input_layer_key].A
+        if issparse(adata_to_use.layers[input_layer_key])
+        else adata_to_use.layers[input_layer_key]
+    )
+
+    age_labels = adata_to_use.obs["age_id"].tolist()  # make sure count from 0
+    age_labels = np.array(age_labels)
+
+    batch_ids = adata_to_use.obs["batch_id"].tolist()
+    num_batch_types = len(set(batch_ids))
+    batch_ids = np.array(batch_ids)
+    return all_counts,age_labels,batch_ids
+# %%
+def evaluate(model: nn.Module, loader: DataLoader) -> float:
     """
     Evaluate the model on the evaluation data.
     """
-    soft = nn.Softmax()
+    model.eval()
+    total_loss = 0.0
+    total_error = 0.0
+    total_acc = 0.0
+    total_dab = 0.0
+    total_num = 0
     predictions = []
     preds_all = []
+    cell_embed_all = []
     with torch.no_grad():
         for batch_data in loader:
             input_gene_ids = batch_data["gene_ids"].to(device)
@@ -808,219 +860,57 @@ def get_preds_and_probas(model: nn.Module, loader: DataLoader) -> float:
                     CCE=False,
                     MVC=False,
                     ECS=False,
-                    do_sample=do_sample_in_train,
+                    do_sample=do_sample_in_train
                     #generative_training = False,
                 )
                 output_values = output_dict["cls_output"]
+                loss = criterion_cls(output_values, age_labels)
 
+                if DAB:
+                    loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
+
+            total_loss += loss.item() * len(input_gene_ids)
+            accuracy = (output_values.argmax(1) == age_labels).sum().item()
+            total_acc += accuracy / len(input_gene_ids) * len(input_gene_ids)
+            total_error += (1 - accuracy / len(input_gene_ids)) * len(input_gene_ids)
+            total_dab += loss_dab.item() * len(input_gene_ids) if DAB else 0.0
+            total_num += len(input_gene_ids)
             preds = output_values.argmax(1).cpu().numpy()
-            probas_ones = (soft(output_values)[:,1]).cpu().numpy()
             predictions.append(preds)
-            preds_all.append(probas_ones)
-    predictions_result = np.concatenate(predictions, axis=0)
-    preds_all_result = np.concatenate(preds_all,axis=0)
-    return predictions_result, preds_all_result
-
-
-def model_predict(model,adata,gene_ids):
-    preprocessor = Preprocessor(
-    use_key="X",  # the key in adata.layers to use as raw data
-    filter_gene_by_counts=filter_gene_by_counts,  # step 1
-    filter_cell_by_counts=True,  # step 2
-    normalize_total=1e4,  # 3. whether to normalize the raw data and to what sum
-    result_normed_key="X_normed",  # the key in adata.layers to store the normalized data
-    log1p=data_is_raw,  # 4. whether to log1p the normalized data
-    result_log1p_key="X_log1p",
-    subset_hvg=False,  # 5. whether to subset the raw data to highly variable genes
-    hvg_flavor="seurat_v3" if data_is_raw else "cell_ranger",
-    binning=n_bins,  # 6. whether to bin the raw data and to what number of bins
-    result_binned_key="X_binned",  # the key in adata.layers to store the binned data
-    )
-
-    preprocessor(adata, batch_key=None)
-    
-    all_counts = (
-        adata.layers[input_layer_key].A
-        if issparse(adata.layers[input_layer_key])
-        else adata.layers[input_layer_key]
-    )
-
-    age_labels = adata.obs["age_id"].tolist()  # make sure count from 0
-    age_labels = np.array(age_labels)
-
-    batch_ids = adata.obs["batch_id"].tolist()
-    batch_ids = np.array(batch_ids)
-
-    tokenized_edited = tokenize_and_pad_batch(
-            all_counts,
-            gene_ids,
-            max_len=max_seq_len,
-            vocab=vocab,
-            pad_token=pad_token,
-            pad_value=pad_value,
-            append_cls=True,  # append <cls> token at the beginning
-            include_zero_gene=True,
-    )
-
-    input_values_edited = random_mask_value(
-            tokenized_edited["values"],
-            mask_ratio=mask_ratio,
-            mask_value=mask_value,
-            pad_value=pad_value,
-    )
-
-    edited_data_pt = {
-            "gene_ids": tokenized_edited["genes"],
-            "values": input_values_edited,
-            "target_values": tokenized_edited["values"],
-            "batch_labels": torch.from_numpy(batch_ids).long(),
-            "age_labels": torch.from_numpy(age_labels).long(),
-    }
-
-    edited_loader = DataLoader(
-            dataset=SeqDataset(edited_data_pt),
-            batch_size=eval_batch_size,
-            shuffle=False,
-            drop_last=False,
-    )
-
-    model.eval()
-    predictions,probas = get_preds_and_probas(
+            preds_all.append(output_values)
+            cell_embed_all.append(output_dict['cell_emb'])
+    return np.concatenate(predictions, axis=0), preds_all, cell_embed_all
+# %%
+epoch = 5
+# %%
+model.eval()
+predictions,probas,embedings = evaluate(
         model,
-        loader=edited_loader
-    )
-    return {'predictions':predictions,
-            'probas':probas}
-#%%
-def create_synt_adata(adata,gene,fill_max=True):
-    if fill_max:
-        new_gene_expression = np.full((adata.n_obs,),10000)
-    else:
-        new_gene_expression = np.full((adata.n_obs,),0)
-    adata_test_genes = adata.copy()
-    new_var = pd.DataFrame(index=[gene])
+        loader=test_loader,
+        #return_raw=True,
+)
+# %%
+soft_max = nn.Softmax()
+probas_final = np.concatenate([np.array(soft_max(i).cpu().numpy()) for i in probas])
+probas_ones = probas_final[:,1]
+# compute accuracy, precision, recall, f1
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-    for col in adata_test_genes.var.columns:
-        new_var[col] = np.nan
-        
-    adata_test_genes_var = pd.concat([adata_test_genes.var, new_var])
+accuracy = accuracy_score(age_labels, predictions)
+precision = precision_score(age_labels, predictions, average="macro")
+recall = recall_score(age_labels, predictions, average="macro")
+macro_f1 = f1_score(age_labels, predictions, average="macro")
+roc_auc = roc_auc_score(age_labels, probas_ones)
+logger.info(
+        f"Accuracy: {accuracy:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}, "
+        f"Macro F1: {macro_f1:.3f}, ROC-AUC: {roc_auc:.3f}"
+)
 
-    new_gene_expression_sparse = csr_matrix(new_gene_expression.reshape(-1,1))
-
-    adata_test_genes_X = hstack([adata_test_genes.X, new_gene_expression_sparse])
-    adata_test_genes_new = sc.AnnData(X=adata_test_genes_X,obs=adata_test_genes.obs,var=adata_test_genes_var)
-    return adata_test_genes_new
-
-# Run perturbation analysis 4 times with different cell subsets
-n_runs = 10
-all_raw_dfs = []
-
-for run_idx in range(n_runs):
-    logger.info(f"Starting run {run_idx + 1}/{n_runs} with random_state={run_idx}")
-    
-    # Create different subset for each run using different random_state
-    adata_subsets = []
-    for tissue in tqdm(adata_test.obs['tissue'].unique(), desc=f"Run {run_idx + 1}: Sampling cells"):
-        temp_adata = adata_test[adata_test.obs['tissue']==tissue]
-        # Sample 100 cells per tissue (or all cells if tissue has fewer than 100)
-        n_cells_to_sample = min(100, temp_adata.n_obs)
-        if n_cells_to_sample < temp_adata.n_obs:
-            smlpd_adata = sc.pp.subsample(temp_adata, n_obs=n_cells_to_sample, random_state=run_idx, copy=True)
-        else:
-            # If tissue has <= 100 cells, use all of them
-            smlpd_adata = temp_adata.copy()
-        
-        # Ensure unique obs indices by adding tissue prefix and run_idx
-        unique_names = []
-        for i, orig_idx in enumerate(smlpd_adata.obs_names):
-            unique_names.append(f"run{run_idx}_{tissue}_{i}_{orig_idx}")
-        smlpd_adata.obs_names = unique_names
-        
-        # Ensure var indices are unique
-        if not smlpd_adata.var_names.is_unique:
-            logger.warning(f"Run {run_idx + 1}, tissue {tissue}: Found duplicate var names, making them unique")
-            smlpd_adata.var_names_make_unique()
-        
-        # Ensure var DataFrame index matches var_names
-        smlpd_adata.var.index = smlpd_adata.var_names
-        
-        adata_subsets.append(smlpd_adata)
-    
-    # Before concatenating, ensure all objects have the same var (genes)
-    if len(adata_subsets) > 0:
-        # Get the intersection of all var names
-        all_var_names = set(adata_subsets[0].var_names)
-        for adata in adata_subsets[1:]:
-            all_var_names = all_var_names.intersection(set(adata.var_names))
-        
-        # Filter all adata objects to have the same genes
-        common_genes = sorted(list(all_var_names))
-        logger.info(f"Run {run_idx + 1}: Using {len(common_genes)} common genes across all tissues")
-        adata_subsets = [adata[:, common_genes].copy() for adata in adata_subsets]
-        
-        # Double-check var indices are unique and aligned
-        for adata in adata_subsets:
-            if not adata.var_names.is_unique:
-                adata.var_names_make_unique()
-            adata.var.index = adata.var_names
-        
-        # Concatenate along obs axis (cells)
-        subsampled_adata = sc.concat(adata_subsets, axis=0, join='inner', index_unique="-")
-    else:
-        raise ValueError(f"Run {run_idx + 1}: No adata subsets to concatenate")
-    
-    raw_df = pd.DataFrame({
-        'cells': subsampled_adata.obs.index,
-        'tissue': subsampled_adata.obs['tissue'],
-        'age_category': subsampled_adata.obs['age_category'],
-        'age_id': subsampled_adata.obs['age_id'],
-        'run_id': run_idx  # Track which run this data comes from
-    })
-    
-    # Run perturbation analysis for this subset
-    logger.info(f"Run {run_idx + 1}: Processing {len(subsampled_adata.var_names)} genes")
-    for gene_idx, gene_name in tqdm(enumerate(subsampled_adata.var_names), 
-                                       desc=f"Run {run_idx + 1}: Genes",
-                                       total=len(subsampled_adata.var_names)):
-        adata_test_genes = subsampled_adata.copy()
-        try:
-            adata_high = create_synt_adata(adata_test_genes, gene=gene_name, fill_max=True)
-            adata_low = create_synt_adata(adata_test_genes, gene=gene_name, fill_max=False)
-            
-            gene_ids = np.array(vocab(adata_high.var_names.tolist()), dtype=int)
-            
-            result_high = model_predict(model, adata_high, gene_ids)
-            result_low = model_predict(model, adata_low, gene_ids)
-            
-            high_mean_result = result_high['probas'].mean()
-            low_mean_result = result_low['probas'].mean()
-            
-            raw_df[f'{gene_name}_high'] = result_high['probas']
-            raw_df[f'{gene_name}_low'] = result_low['probas']
-            
-            if gene_idx % 50 == 0:
-                logger.info(f'Run {run_idx + 1}: {gene_name} - High mean: {high_mean_result:.4f}, Low mean: {low_mean_result:.4f}')
-        except Exception as e:
-            logger.warning(f"Run {run_idx + 1}: Error processing {gene_name}: {e}")
-            raw_df[f'{gene_name}_high'] = np.nan
-            raw_df[f'{gene_name}_low'] = np.nan
-        
-        # Save intermediate results every 50 genes
-        if gene_idx % 50 == 0:
-            os.makedirs('data', exist_ok=True)
-            raw_df.to_csv(f'data/gene_results_run{run_idx + 1}.csv', index=False)
-    
-    # Save final results for this run
-    os.makedirs('data', exist_ok=True)
-    raw_df.to_csv(f'data/gene_results_run{run_idx + 1}.csv', index=False)
-    all_raw_dfs.append(raw_df)
-    logger.info(f"Run {run_idx + 1} completed. Saved to data/gene_results_run{run_idx + 1}.csv")
-
-# Combine all runs into a single dataframe (optional)
-if len(all_raw_dfs) > 0:
-    combined_df = pd.concat(all_raw_dfs, ignore_index=True)
-    os.makedirs('data', exist_ok=True)
-    combined_df.to_csv('data/gene_results_all_runs.csv', index=False)
-    logger.info(f"Combined all {n_runs} runs. Total rows: {len(combined_df)}. Saved to data/gene_results_all_runs.csv")
-
+results = {
+        "test/accuracy": accuracy,
+        "test/precision": precision,
+        "test/recall": recall,
+        "test/macro_f1": macro_f1,
+        "test/roc_auc": roc_auc,
+}
 # %%
