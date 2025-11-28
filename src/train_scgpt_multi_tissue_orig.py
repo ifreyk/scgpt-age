@@ -427,7 +427,7 @@ mask_value = "auto"  # for masked values, now it should always be auto
 include_zero_gene = config[
     "include_zero_gene"
 ]  # if True, include zero genes among hvgs in the training
-max_seq_len = 1000
+max_seq_len = 900
 n_bins = config["n_bins"]
 
 # input/output representation
@@ -519,7 +519,7 @@ for tissue in TISSUES:
     print(f"Processing tissue: {tissue}")
     print(f"{'='*80}\n")
     # Create tissue-specific save directory
-    base_save_dir = Path(f"save/scgpt_multi_tissue")
+    base_save_dir = Path(f"save/scgpt_multi_tissue_orig")
     save_dir = base_save_dir / tissue
     save_dir.mkdir(parents=True, exist_ok=True)
     
@@ -560,30 +560,20 @@ for tissue in TISSUES:
     adata_train.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_train.obs['age_category']]
     adata_test.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_test.obs['age_category']]
     
-    # Load top 1000 genes from logistic regression coefficients
-    coefficients_path = Path(f"save/logistic_regression_multi_tissue_regul/{tissue}/coefficients.csv")
-    if not coefficients_path.exists():
-        logger.error(f"Coefficients file not found: {coefficients_path}")
-        results_summary.append({"tissue": tissue, "status": "error", "error": f"File not found: {coefficients_path}"})
-        continue
-    
-    logger.info(f"Loading coefficients from {coefficients_path}")
-    coefficients_df = pd.read_csv(coefficients_path)
-    
-    # Sort by absolute value of coefficient and take top 1000
-    coefficients_df['abs_coefficient'] = coefficients_df['coefficient'].abs()
-    coefficients_df = coefficients_df.sort_values('abs_coefficient', ascending=False)
-    top_1000_genes = coefficients_df.head(1000)['gene'].tolist()
+    ageanno_genes = pd.read_csv("src/data/Aging-related DEGs.txt", encoding='iso-8859-1')
+    ageanno_genes = ageanno_genes[ageanno_genes['group']=='old vs mid']
+    ageanno_genes = ageanno_genes[ageanno_genes['p_val_adj']<0.05]
+    ageanno_genes = ageanno_genes[(ageanno_genes['isTissuespecific']==False) & (ageanno_genes['isCellTypespecific']==False)]
+    unique_genes = ageanno_genes['gene'].unique().tolist()
     
     logger.info(f"Selected top 1000 genes by absolute coefficient value")
-    logger.info(f"Top 5 genes: {top_1000_genes[:5]}")
-    logger.info(f"Top 5 coefficients: {coefficients_df.head(5)['coefficient'].tolist()}")
+    logger.info(f"Top 5 genes: {unique_genes[:5]}")
     
     # Find which genes actually exist in the data
     train_gene_names = set(adata_train.var_names)
     test_gene_names = set(adata_test.var_names)
-    available_genes = list(set(top_1000_genes) & train_gene_names & test_gene_names)
-    missing_genes = list(set(top_1000_genes) - (train_gene_names & test_gene_names))
+    available_genes = list(set(unique_genes) & train_gene_names & test_gene_names)
+    missing_genes = list(set(unique_genes) - (train_gene_names & test_gene_names))
     
     if len(missing_genes) > 0:
         logger.warning(f"{len(missing_genes)} genes from top 1000 are not present in the data. First 10 missing: {missing_genes[:10]}")
@@ -1467,7 +1457,7 @@ for tissue in TISSUES:
         return total_loss / total_num, total_error / total_num, total_acc / total_num
 
 
-    best_val_loss = float("inf")
+    best_accuracy = 0.0
     best_avg_bio = 0.0
     best_model = None
     best_model_epoch = 0
@@ -1508,27 +1498,27 @@ for tissue in TISSUES:
         )
         logger.info("-" * 89)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
             best_model = copy.deepcopy(model)
             best_model_epoch = epoch
             patience_counter = 0  # reset patience counter
-            logger.info(f"Best model with score {best_val_loss:5.4f}")
+            logger.info(f"Best model with accuracy {best_accuracy:5.4f}")
         else:
             patience_counter += 1
-            logger.info(f"Validation loss did not improve. Patience: {patience_counter}/{early_stopping_patience}")
+            logger.info(f"Validation accuracy did not improve. Patience: {patience_counter}/{early_stopping_patience}")
             
             # Early stopping
             if patience_counter >= early_stopping_patience:
-                logger.info(f"Early stopping triggered at epoch {epoch}. Best validation loss: {best_val_loss:5.4f}")
+                logger.info(f"Early stopping triggered at epoch {epoch}. Best validation accuracy: {best_accuracy:5.4f}")
                 break
 
         # Update learning rate scheduler
         current_lr = optimizer.param_groups[0]['lr']
         if config.get("use_reduce_lr_on_plateau", False):
             # Log before scheduler step for debugging
-            logger.info(f"Before scheduler step: current_lr={current_lr:.6f}, val_loss={val_loss:.4f}, best_val_loss={best_val_loss:.4f}")
-            scheduler.step(val_loss)  # ReduceLROnPlateau needs the metric value
+            logger.info(f"Before scheduler step: current_lr={current_lr:.6f}, val_loss={val_loss:.4f}, accuracy={accuracy:.4f}, best_accuracy={best_accuracy:.4f}")
+            scheduler.step(val_loss)  # ReduceLROnPlateau uses val_loss for LR scheduling
             new_lr = optimizer.param_groups[0]['lr']
             if new_lr < current_lr:
                 logger.info(f"✓ Learning rate reduced from {current_lr:.6f} to {new_lr:.6f}")
@@ -1571,7 +1561,7 @@ for tissue in TISSUES:
             "early_stopping_patience": early_stopping_patience,
             "label_smoothing": label_smoothing,
             "best_model_epoch": best_model_epoch if best_model is not None else None,
-            "best_val_loss": float(best_val_loss) if best_model is not None else None,
+            "best_accuracy": float(best_accuracy) if best_model is not None else None,
         }
     }
     with open(save_dir / "hyperparameters.json", "w") as f:
@@ -1581,7 +1571,7 @@ for tissue in TISSUES:
     # Save the best model (already set during training)
     if best_model is not None:
         torch.save(best_model.state_dict(), save_dir / "best_model.pt")
-        logger.info(f"Saved best model from epoch {best_model_epoch} with validation loss {best_val_loss:.4f}")
+        logger.info(f"Saved best model from epoch {best_model_epoch} with validation accuracy {best_accuracy:.4f}")
     else:
         # Fallback: save current model if no best model was found
         logger.warning("No best model found during training, saving current model")
@@ -1649,7 +1639,7 @@ for tissue in TISSUES:
         "confusion_matrix": cm.tolist(),
         "classification_report": class_report,
         "best_model_epoch": int(best_model_epoch) if best_model is not None else None,
-        "best_val_loss": float(best_val_loss) if best_model is not None else None,
+        "best_accuracy": float(best_accuracy) if best_model is not None else None,
     }
     
     with open(save_dir / "results.json", "w") as f:
