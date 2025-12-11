@@ -25,7 +25,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
 
-def load_confidence_levels(confidence_file: str = "src/data/runs/gene-confidence-level.tsv") -> pd.DataFrame:
+def load_confidence_levels(confidence_file: str = "src/data/gene-confidence-level.tsv") -> pd.DataFrame:
     """
     Load confidence levels from TSV file.
     
@@ -89,19 +89,19 @@ def calculate_gene_statistics(
     
     # Extract gene names from columns (those ending in '_high')
     columns = [
-        x.split('_high')[0] 
+        x.split('_max')[0] 
         for x in result_df.columns 
         if x not in ['Unnamed: 0', 'cells', 'tissue', 'age_category', 'age_id'] 
-        and x.endswith('_high')
+        and x.endswith('_max')
     ]
-    columns = [x for x in columns if not '_low' in x]
+    columns = [x for x in columns if not '_zero' in x]
     
     # Prepare gene data for parallel processing
     gene_data_list = []
     for gene in columns:
-        if f'{gene}_high' in result_df.columns and f'{gene}_low' in result_df.columns:
-            high_values = result_df[f'{gene}_high'].values
-            low_values = result_df[f'{gene}_low'].values
+        if f'{gene}_max' in result_df.columns and f'{gene}_zero' in result_df.columns:
+            high_values = result_df[f'{gene}_max'].values
+            low_values = result_df[f'{gene}_zero'].values
             gene_data_list.append((gene, high_values, low_values))
     
     # Set number of workers
@@ -148,7 +148,7 @@ def calculate_gene_statistics(
     })
     
     # Calculate log fold change
-    stat_test_df['logfc'] = np.log2(stat_test_df['mean_high'] / stat_test_df['mean_low'])
+    stat_test_df['logfc'] = np.log2(stat_test_df['mean_low'] / stat_test_df['mean_high'])
     
     # Apply multiple testing correction (Holm method)
     rejected, p_val_corrected, _, _ = smm.multipletests(
@@ -165,9 +165,9 @@ def calculate_gene_statistics(
     all_changes = []
     for x in stat_test_df.index:
         if stat_test_df.loc[x, 'H0_reject']:
-            if stat_test_df.loc[x, 'logfc'] < -0.2:
+            if stat_test_df.loc[x, 'logfc'] < 0:
                 changes = 'Geroaccelerator'
-            elif stat_test_df.loc[x, 'logfc'] > 0.2:
+            elif stat_test_df.loc[x, 'logfc'] > 0:
                 changes = 'Geroprotector'
             else:
                 changes = 'No changes'
@@ -218,61 +218,94 @@ def calculate_gene_statistics(
 
 
 def process_all_runs(
-    runs_dir: str = "src/data/perturbation_results", 
-    output_dir: str = "src/data/p_val_results",
-    confidence_file: str = "src/data/runs/gene-confidence-level.tsv",
+    perturbation_results_dir: str = "perturbation_results_cls_decoder", 
+    output_base_dir: str = "src/data/p_val_results_cls_h0",
+    confidence_file: str = "src/data/gene-confidence-level.tsv",
     n_workers: int = None
 ):
     """
-    Process all gene_results_run*.csv files in the specified directory.
+    Process all gene_results_run*.csv files from perturbation_results directory.
+    For each tissue, creates a folder in output_base_dir and processes all run files.
     
     Args:
-        runs_dir: Directory containing the run files
-        output_dir: Directory to save output files (default: src/data/p_val_results)
+        perturbation_results_dir: Directory containing tissue folders with run files
+        output_base_dir: Base directory to save output files (default: src/data/p_val_results)
         confidence_file: Path to the gene-confidence-level.tsv file
         n_workers: Number of parallel workers (default: number of CPU cores - 1)
     """
-    # Create output directory if it doesn't exist
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    # Create base output directory if it doesn't exist
+    output_base_path = Path(output_base_dir)
+    output_base_path.mkdir(parents=True, exist_ok=True)
     
     # Load confidence levels
     confidence_df = load_confidence_levels(confidence_file)
     if not confidence_df.empty:
         print(f"Loaded confidence levels for {len(confidence_df)} genes")
     
-    # Find all run files
-    runs_path = Path(runs_dir)
-    run_files = sorted(runs_path.glob("gene_results_run*.csv"))
-    
-    if not run_files:
-        print(f"No gene_results_run*.csv files found in {runs_dir}")
+    # Find all tissue directories
+    perturbation_path = Path(perturbation_results_dir)
+    if not perturbation_path.exists():
+        print(f"Error: Perturbation results directory not found: {perturbation_results_dir}")
         return
     
-    print(f"Found {len(run_files)} run files to process")
+    # Get all subdirectories (tissues)
+    tissue_dirs = [d for d in perturbation_path.iterdir() if d.is_dir()]
     
-    for run_file in run_files:
-        # Calculate statistics
-        stat_test_df = calculate_gene_statistics(
-            str(run_file), 
-            output_dir, 
-            confidence_df,
-            n_workers=n_workers
-        )
-        
-        # Save the results
-        output_file = Path(output_dir) / run_file.name.replace('gene_results_', 'p_val_')
-        stat_test_df.to_csv(output_file, index=False)
-        
-        print(f"Saved results to {output_file}")
-        print(f"Total genes: {len(stat_test_df)}")
-        print(f"Changes distribution:\n{stat_test_df['changes'].value_counts()}")
-        print("-" * 80)
+    if not tissue_dirs:
+        print(f"No tissue directories found in {perturbation_results_dir}")
+        return
     
-    print("\nAll run files processed successfully!")
+    print(f"Found {len(tissue_dirs)} tissue directories to process")
+    print("=" * 80)
+    
+    # Process each tissue
+    for tissue_dir in sorted(tissue_dirs):
+        tissue_name = tissue_dir.name
+        print(f"\n{'=' * 80}")
+        print(f"Processing tissue: {tissue_name}")
+        print(f"{'=' * 80}")
+        
+        # Create tissue-specific output directory
+        tissue_output_dir = output_base_path / tissue_name
+        tissue_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Find all run files (excluding intermediate files)
+        run_files = sorted([
+            f for f in tissue_dir.glob("gene_results_run*.csv")
+            if "_intermediate" not in f.name
+        ])
+        
+        if not run_files:
+            print(f"No gene_results_run*.csv files (excluding intermediate) found in {tissue_dir}")
+            continue
+        
+        print(f"Found {len(run_files)} run files to process for {tissue_name}")
+        
+        for run_file in run_files:
+            # Calculate statistics
+            stat_test_df = calculate_gene_statistics(
+                str(run_file), 
+                str(tissue_output_dir), 
+                confidence_df,
+                n_workers=n_workers
+            )
+            
+            # Save the results
+            output_file = tissue_output_dir / run_file.name.replace('gene_results_', 'p_val_')
+            stat_test_df.to_csv(output_file, index=False)
+            
+            print(f"Saved results to {output_file}")
+            print(f"Total genes: {len(stat_test_df)}")
+            print(f"Changes distribution:\n{stat_test_df['changes'].value_counts()}")
+            print("-" * 80)
+        
+        print(f"\nCompleted processing tissue: {tissue_name}")
+    
+    print("\n" + "=" * 80)
+    print("All tissues processed successfully!")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    # Process all run files
+    # Process all tissues from perturbation_results directory
     process_all_runs()
-
