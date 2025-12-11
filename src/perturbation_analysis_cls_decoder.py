@@ -456,8 +456,8 @@ def create_zero_perturbed_adata(adata, gene_name):
 # Configuration
 # List of tissues to process
 TISSUES = [
-    #"skin",
-    #"bladder",
+    "skin",
+    "bladder",
     "blood",
     "bone-marrow",
     "brain",
@@ -470,7 +470,7 @@ TISSUES = [
 SCGPT_MODEL_PATH = "src/data/models/scGPT_human"
 CLS_DECODER_MODEL_PATH = "save/cls_decoder_on_embeddings"
 DATA_DIR = Path("src/data/donor_divided")
-N_CELLS_TO_SAMPLE = 500
+N_CELLS_TO_SAMPLE = 300
 
 # Settings
 pad_token = "<pad>"

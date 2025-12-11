@@ -171,13 +171,8 @@ Our findings demonstrate that scGPT can capture aging-related transcriptional pa
 ### Prerequisites
 - Python 3.11+
 - PyTorch 2.0.0 - 2.2.0 (tested with 2.1.2+cu121)
-- CUDA-compatible GPU (recommended: NVIDIA H200 with 140GB memory)
+- CUDA-compatible GPU (recommended: NVIDIA RTX 4090 with 24GB memory or higher)
 - UV package manager (for dependency management)
-
-### Dependencies
-```bash
-uv sync
-```
 
 ### Setup
 1. Clone the repository:
@@ -186,43 +181,66 @@ git clone https://github.com/ifreyk/scgpt-age.git
 cd scgpt-age
 ```
 
-2. Install all dependencies:
+2. Install all dependencies using UV:
 ```bash
 uv sync
 ```
+This command will:
+- Read dependencies from `pyproject.toml`
+- Install all required packages using the locked versions in `uv.lock`
+- Set up the project environment
 
 3. Install the package in development mode:
 ```bash
 uv pip install -e .
 ```
 
+**Note**: The project uses `pyproject.toml` for project configuration and `uv.lock` for dependency locking to ensure reproducible builds.
+
 ## Usage
 
-The pipeline consists of three main scripts that should be run sequentially:
+The pipeline consists of several scripts that can be run to reproduce the analysis:
 
-### 1. Training with Age-Associated Genes (Recommended for Reproducibility)
+### 1. Train Classification Head on scGPT Embeddings
 ```bash
-python src/train_scgpt_diffexpressed_genes.py
+python src/train_cls_decoder_on_embeddings.py
 ```
-This trains the scGPT model using differentially expressed genes identified in the AgeAnno study, providing the most reproducible results.
+Trains separate ImprovedCls classification heads on scGPT embeddings for each tissue. This script:
+- Loads the pre-trained frozen scGPT encoder
+- Extracts cell embeddings from train and test data
+- Trains a separate ImprovedCls head for each tissue
+- Saves model weights and performance metrics
 
-### 2. Training with Random Genes (Alternative Approach)
+### 2. Gene Perturbation Analysis
 ```bash
-python src/train_scgpt_random_genes.py
+python src/perturbation_analysis_cls_decoder.py
 ```
-Alternative training approach using randomly selected genes for comparison and robustness testing.
+Performs systematic *in silico* gene perturbations to identify pro- and anti-aging gene candidates. This script:
+- Loads the frozen scGPT encoder and trained classification heads
+- Samples cells from test data (stratified by age category)
+- For each gene, creates knockout (zero expression) and overexpression (max expression) perturbations
+- Computes statistical significance and classifies genes as pro-aging or anti-aging candidates
+- Saves results for downstream analysis
 
-### 3. Gene Perturbation Analysis
-```bash
-python src/perturbation_analysis.py
-```
-Performs systematic *in silico* gene perturbations to identify pro- and anti-aging genes. This script automatically loads the trained model and performs the perturbation analysis.
+**Configuration**: Edit the script to set `TISSUE` (default: "skin") and `N_CELLS_TO_SAMPLE` (default: 500).
 
-### 4. Extended Perturbation Analysis (Optional)
+### 3. Compare with Logistic Regression Baseline
 ```bash
-python src/perturbation_analysis_extend.py
+python src/compare_logistic_regression_multi_tissue.py
 ```
-Extended version of the perturbation analysis with additional features and configurations.
+Compares scGPT performance with logistic regression baseline across multiple tissues. This script:
+- Trains logistic regression models on the same gene set
+- Evaluates performance metrics (ROC-AUC, accuracy, etc.)
+- Generates comparison plots and statistics
+
+### 4. Calculate Gene Statistics (Post-processing)
+```bash
+python src/calculate_gene_statistics.py
+```
+Processes perturbation results to calculate gene-level statistics across multiple runs. This script:
+- Aggregates results from multiple perturbation analysis runs
+- Computes stability metrics and significance across iterations
+- Generates summary statistics for candidate genes
 
 ## Project Structure
 
@@ -230,23 +248,29 @@ Extended version of the perturbation analysis with additional features and confi
 scgpt-age/
 ├── src/
 │   ├── data/
-│   │   ├── models/                   # Pretrained models
-│   │   └── [dataset files]           # AgeAnno dataset and processed data
-│   ├── perturbation_analysis.py      # Main perturbation analysis script
-│   ├── train_scgpt_random_genes.py   # Training with random gene selection
-│   ├── train_scgpt_diffexpressed_genes.py  # Training with DE genes
-│   └── scgpt_age.egg-info/           # Package metadata
-├── save/                             # Model checkpoints and logs
-├── pyproject.toml                    # Project configuration
-├── uv.lock                          # Dependency lock file
+│   │   ├── models/                              # Pretrained scGPT models
+│   │   │   ├── scGPT_human/                    # Base scGPT model
+│   │   │   └── scGPT_best_age/                 # Fine-tuned age model
+│   │   ├── perturbation_results/                # Perturbation analysis results
+│   │   └── [dataset files]                      # AgeAnno dataset files
+│   ├── train_cls_decoder_on_embeddings.py      # Train classification heads on embeddings
+│   ├── perturbation_analysis_cls_decoder.py    # Main perturbation analysis script
+│   ├── compare_logistic_regression_multi_tissue.py  # Compare with LR baseline
+│   ├── calculate_gene_statistics.py             # Post-process perturbation results
+│   ├── improved_cls_decoder.py                 # ImprovedCls decoder implementation
+│   └── scgpt_age.egg-info/                     # Package metadata
+├── save/                                        # Model checkpoints and logs
+├── pyproject.toml                               # Project configuration and dependencies
+├── uv.lock                                      # Locked dependency versions
 └── README.md
 ```
 
 ## Key Scripts
 
-- **`train_scgpt_diffexpressed_genes.py`**: Main training pipeline using age-associated genes (recommended for reproducibility)
-- **`train_scgpt_random_genes.py`**: Alternative training pipeline with random gene selection
-- **`perturbation_analysis.py`**: Gene perturbation analysis to identify pro- and anti-aging genes
+- **`train_cls_decoder_on_embeddings.py`**: Trains ImprovedCls classification heads on scGPT embeddings for each tissue
+- **`perturbation_analysis_cls_decoder.py`**: Performs systematic gene perturbations to identify pro- and anti-aging candidates
+- **`compare_logistic_regression_multi_tissue.py`**: Compares scGPT performance with logistic regression baseline
+- **`calculate_gene_statistics.py`**: Processes and aggregates perturbation results across multiple runs
 
 
 ## Limitations
