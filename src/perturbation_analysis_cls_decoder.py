@@ -30,6 +30,7 @@ import shutil
 import sys
 import time
 import traceback
+from types import SimpleNamespace
 from typing import List, Tuple, Dict, Union, Optional
 import warnings
 import pandas as pd
@@ -39,7 +40,10 @@ from anndata import AnnData
 import scanpy as sc
 import seaborn as sns
 import numpy as np
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from scipy.sparse import issparse, csr_matrix, hstack
 import matplotlib.pyplot as plt
 from torch import nn
@@ -47,10 +51,6 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-from torchtext.vocab import Vocab
-from torchtext._torchtext import (
-    Vocab as VocabPybind,
-)
 from scipy.stats import mannwhitneyu
 import statsmodels.stats.multitest as smm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -289,8 +289,8 @@ def get_preds_and_probas(encoder_model: nn.Module, cls_decoder: nn.Module, loade
                 logits = cls_decoder(cell_emb)
                 
                 if use_bce:
-                    # For BCE: apply sigmoid to get probabilities
-                    probs_bce = torch.sigmoid(logits[:, 1])
+                    # The BCE-trained head emits one logit for the old-age class.
+                    probs_bce = torch.sigmoid(logits.squeeze(-1))
                     probs = torch.stack([1 - probs_bce, probs_bce], dim=1)
                     preds = (probs_bce > 0.5).long()
                     probas_ones = probs_bce.cpu().numpy()
@@ -323,7 +323,7 @@ def model_predict(encoder_model, cls_decoder, adata, gene_ids, use_bce=False):
     preprocessor(adata, batch_key=None)
     
     all_counts = (
-        adata.layers[input_layer_key].A
+        adata.layers[input_layer_key].toarray()
         if issparse(adata.layers[input_layer_key])
         else adata.layers[input_layer_key]
     )
@@ -455,7 +455,7 @@ def create_zero_perturbed_adata(adata, gene_name):
 
 # Configuration
 # List of tissues to process
-TISSUES = [
+DEFAULT_TISSUES = [
     "skin",
     "bladder",
     "blood",
@@ -466,11 +466,34 @@ TISSUES = [
     "skeletal-muscle",
     "stomach"
 ]
+TISSUES = [
+    tissue.strip()
+    for tissue in os.getenv("SCGPT_AGE_TISSUES", ",".join(DEFAULT_TISSUES)).split(",")
+    if tissue.strip()
+]
 
-SCGPT_MODEL_PATH = "src/data/models/scGPT_human"
-CLS_DECODER_MODEL_PATH = "save/cls_decoder_on_embeddings"
-DATA_DIR = Path("src/data/donor_divided")
-N_CELLS_TO_SAMPLE = 300
+SCGPT_MODEL_PATH = os.getenv("SCGPT_AGE_MODEL_DIR", "src/data/models/scGPT_human")
+CLS_DECODER_MODEL_PATH = os.getenv(
+    "SCGPT_AGE_CLS_SAVE_DIR", "save/cls_decoder_on_embeddings"
+)
+DATA_DIR = Path(os.getenv("SCGPT_AGE_DATA_DIR", "src/data/donor_divided"))
+PERTURBATION_OUTPUT_DIR = Path(
+    os.getenv("SCGPT_AGE_PERTURB_OUTPUT_DIR", "perturbation_results_cls_decoder")
+)
+AGEANNO_GENES_PATH = Path(
+    os.getenv("SCGPT_AGE_DEG_PATH", "src/data/Aging-related DEGs.txt")
+)
+N_CELLS_TO_SAMPLE = int(os.getenv("SCGPT_AGE_PERTURB_CELLS", "300"))
+N_RUNS = int(os.getenv("SCGPT_AGE_PERTURB_RUNS", "10"))
+
+
+def env_flag(name: str, default: bool) -> bool:
+    return os.getenv(name, str(int(default))).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 # Settings
 pad_token = "<pad>"
@@ -478,7 +501,7 @@ special_tokens = [pad_token, "<cls>", "<eoc>"]
 mask_ratio = 0.0
 mask_value = "auto"
 include_zero_gene = False
-max_seq_len = 900
+max_seq_len = int(os.getenv("SCGPT_AGE_MAX_SEQ_LEN", "900"))
 n_bins = 51
 
 # input/output representation
@@ -520,7 +543,7 @@ hyperparameter_defaults = dict(
     ecs_thres=0.0,
     dab_weight=0.0,
     lr=1e-4,
-    batch_size=100,
+    batch_size=int(os.getenv("SCGPT_AGE_BATCH_SIZE", "100")),
     layer_size=128,
     nlayers=4,
     nhead=5,
@@ -528,9 +551,9 @@ hyperparameter_defaults = dict(
     weight_decay=3e-4,
     schedule_ratio=0.9,
     save_eval_interval=5,
-    fast_transformer=True,
+    fast_transformer=env_flag("SCGPT_AGE_FAST_TRANSFORMER", True),
     pre_norm=False,
-    amp=True,
+    amp=env_flag("SCGPT_AGE_AMP", True),
     include_zero_gene=False,
     freeze=True,
     DSBN=False,
@@ -541,13 +564,17 @@ hyperparameter_defaults = dict(
     reduce_lr_patience=1,
     min_lr=1e-6,
 )
-run = wandb.init(
-    config=hyperparameter_defaults,
-    project="scGPT",
-    reinit=True,
-    settings=wandb.Settings(start_method="thread"),
-)
-config = wandb.config
+if wandb is not None and not env_flag("SCGPT_AGE_DISABLE_WANDB", False):
+    run = wandb.init(
+        config=hyperparameter_defaults,
+        project="scGPT",
+        reinit=True,
+        settings=wandb.Settings(start_method="thread"),
+    )
+    config = wandb.config
+else:
+    run = None
+    config = SimpleNamespace(**hyperparameter_defaults)
 print(config)
 # settings for optimizer
 lr = config.lr
@@ -605,7 +632,7 @@ for TISSUE in TISSUES:
     logger.info("=" * 80)
     
     # Create save directory for this tissue
-    save_dir = Path(f"perturbation_results_cls_decoder/{TISSUE}/")
+    save_dir = PERTURBATION_OUTPUT_DIR / TISSUE
     save_dir.mkdir(parents=True, exist_ok=True)
     print(f"save to {save_dir}")
     scg.utils.add_file_handler(logger, save_dir / "run.log")
@@ -639,6 +666,15 @@ for TISSUE in TISSUES:
     adata_train.obs["batch_id"] = 0
     adata_test.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_test.obs['age_category']]
     adata_train.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_train.obs['age_category']]
+
+    donor_overlap = set(adata_train.obs["orig.ident"].astype(str)) & set(
+        adata_test.obs["orig.ident"].astype(str)
+    )
+    if donor_overlap:
+        raise ValueError(
+            f"Donor leakage between train and test for {TISSUE}: "
+            f"{sorted(donor_overlap)}"
+        )
 
     # Keep raw copies for perturbation (before preprocessing)
     adata_test_raw = adata_test.copy()
@@ -677,7 +713,7 @@ for TISSUE in TISSUES:
 
     # Load and filter Aging-related DEGs
     logger.info("Loading Aging-related DEGs table")
-    ageanno_genes = pd.read_csv("src/data/Aging-related DEGs.txt", encoding='iso-8859-1')
+    ageanno_genes = pd.read_csv(AGEANNO_GENES_PATH, encoding='iso-8859-1')
     ageanno_genes = ageanno_genes[ageanno_genes['group']=='old vs mid']
     ageanno_genes = ageanno_genes[ageanno_genes['p_val_adj']<0.05]
     ageanno_genes = ageanno_genes[(ageanno_genes['isTissuespecific']==False) & (ageanno_genes['isCellTypespecific']==False)]
@@ -837,14 +873,24 @@ for TISSUE in TISSUES:
     encoder_model.eval()
 
     # Load ImprovedCls head
-    cls_decoder_file = CLS_DECODER_SAVE_DIR / "best_model.pt"
+    final_decoder_file = CLS_DECODER_SAVE_DIR / "final_model.pt"
+    legacy_decoder_file = CLS_DECODER_SAVE_DIR / "best_model.pt"
+    cls_decoder_file = (
+        final_decoder_file if final_decoder_file.exists() else legacy_decoder_file
+    )
     if not cls_decoder_file.exists():
         logger.error(f"ImprovedCls file not found: {cls_decoder_file}. Skipping tissue {TISSUE}.")
         continue
 
-    # Check if we need to determine use_bce from results.json
+    try:
+        cls_decoder_state = torch.load(cls_decoder_file, map_location=device)
+        decoder_output_dim = int(cls_decoder_state["out_layer.weight"].shape[0])
+    except Exception as e:
+        logger.error(f"Could not inspect ImprovedCls checkpoint: {e}")
+        continue
+
+    # Read the declared loss and verify it against the checkpoint output shape.
     results_file = CLS_DECODER_SAVE_DIR / "results.json"
-    use_bce = False
     if results_file.exists():
         with open(results_file, "r") as f:
             results = json.load(f)
@@ -852,14 +898,25 @@ for TISSUE in TISSUES:
             use_bce = config_from_file.get("use_bce_loss", False) and num_types == 2
             logger.info(f"Loaded use_bce={use_bce} from results.json")
     else:
-        # Default: assume BCE for binary classification
-        use_bce = num_types == 2
-        logger.info(f"results.json not found, defaulting to use_bce={use_bce} for binary classification")
+        use_bce = decoder_output_dim == 1 and num_types == 2
+        logger.warning(
+            f"results.json not found; inferred use_bce={use_bce} "
+            f"from checkpoint output dimension {decoder_output_dim}"
+        )
+
+    expected_output_dim = 1 if use_bce else num_types
+    if decoder_output_dim != expected_output_dim:
+        logger.error(
+            "Checkpoint/loss mismatch: "
+            f"use_bce={use_bce} expects {expected_output_dim} output(s), "
+            f"checkpoint has {decoder_output_dim}. Skipping tissue {TISSUE}."
+        )
+        continue
 
     # Create ImprovedCls
     cls_decoder = ImprovedCls(
         d_model=embsize,
-        n_cls=num_types,
+        n_cls=decoder_output_dim,
         hidden_dim=1024,
         nlayers=5,
         activation=nn.GELU,
@@ -870,7 +927,7 @@ for TISSUE in TISSUES:
 
     # Load ImprovedCls weights
     try:
-        cls_decoder.load_state_dict(torch.load(cls_decoder_file, map_location=device))
+        cls_decoder.load_state_dict(cls_decoder_state)
         logger.info(f"Loading ImprovedCls from {cls_decoder_file}")
     except Exception as e:
         logger.error(f"Error loading ImprovedCls: {e}")
@@ -897,7 +954,7 @@ for TISSUE in TISSUES:
 
     # Get max expression for each gene
     if issparse(combined_adata.X):
-        max_expressions = combined_adata.X.max(axis=0).A.flatten()
+        max_expressions = combined_adata.X.max(axis=0).toarray().flatten()
     else:
         max_expressions = combined_adata.X.max(axis=0)
 
@@ -905,7 +962,7 @@ for TISSUE in TISSUES:
     logger.info(f"Calculated max expressions for {len(max_expression_dict)} genes")
 
     # Run perturbation analysis 10 times with different cell subsets
-    n_runs = 10
+    n_runs = N_RUNS
     all_raw_dfs = []
 
     for run_idx in range(n_runs):
@@ -957,7 +1014,7 @@ for TISSUE in TISSUES:
             'run_id': run_idx,  # Track which run this data comes from
         })
 
-        for gene_idx, gene_name in tqdm(enumerate(sampled_adata.var_names), 
+        for gene_idx, gene_name in tqdm(enumerate(sampled_adata.var_names),
                                             desc=f"Run {run_idx + 1}: Genes",
                                             total=len(sampled_adata.var_names)):
             # Get max expression for this gene
@@ -1022,4 +1079,3 @@ for TISSUE in TISSUES:
 logger.info("All tissues processed successfully!")
 
 # %%
-

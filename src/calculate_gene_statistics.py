@@ -116,28 +116,40 @@ def calculate_gene_statistics(
     mean_low_list = []
     p_vals = []
     
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        # Submit all tasks
-        future_to_gene = {
-            executor.submit(_process_single_gene, gene_data): gene_data[0] 
-            for gene_data in gene_data_list
-        }
-        
-        # Collect results with progress bar
-        for future in tqdm(
-            as_completed(future_to_gene), 
+    if n_workers == 1:
+        gene_results = map(_process_single_gene, gene_data_list)
+        for gene, mean_high, mean_low, p in tqdm(
+            gene_results,
             total=len(gene_data_list),
-            desc=f"Processing genes in {os.path.basename(run_file)}"
+            desc=f"Processing genes in {os.path.basename(run_file)}",
         ):
-            try:
-                gene, mean_high, mean_low, p = future.result()
-                genes_all.append(gene)
-                mean_high_list.append(mean_high)
-                mean_low_list.append(mean_low)
-                p_vals.append(p)
-            except Exception as exc:
-                gene = future_to_gene[future]
-                print(f'Gene {gene} generated an exception: {exc}')
+            genes_all.append(gene)
+            mean_high_list.append(mean_high)
+            mean_low_list.append(mean_low)
+            p_vals.append(p)
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            # Submit all tasks
+            future_to_gene = {
+                executor.submit(_process_single_gene, gene_data): gene_data[0]
+                for gene_data in gene_data_list
+            }
+
+            # Collect results with progress bar
+            for future in tqdm(
+                as_completed(future_to_gene),
+                total=len(gene_data_list),
+                desc=f"Processing genes in {os.path.basename(run_file)}",
+            ):
+                try:
+                    gene, mean_high, mean_low, p = future.result()
+                    genes_all.append(gene)
+                    mean_high_list.append(mean_high)
+                    mean_low_list.append(mean_low)
+                    p_vals.append(p)
+                except Exception as exc:
+                    gene = future_to_gene[future]
+                    print(f'Gene {gene} generated an exception: {exc}')
     
     # Create DataFrame with basic statistics
     stat_test_df = pd.DataFrame({

@@ -24,6 +24,7 @@ from sklearn.metrics import (
 )
 import warnings
 import json
+import os
 from scipy.sparse import issparse
 from typing import List, Dict, Tuple
 
@@ -34,7 +35,7 @@ sc.set_figure_params(figsize=(6, 6))
 
 # Configuration: List of tissues to process
 # Example: TISSUES = ["skin", "bladder", "lung", "heart"]
-TISSUES = [
+DEFAULT_TISSUES = [
     "skin",
     "bladder",
     "blood",
@@ -46,12 +47,26 @@ TISSUES = [
     "skeletal-muscle",
     "stomach",
 ]  # Modify this list to include multiple tissues
+TISSUES = [
+    tissue.strip()
+    for tissue in os.getenv("SCGPT_AGE_TISSUES", ",".join(DEFAULT_TISSUES)).split(",")
+    if tissue.strip()
+]
 
 # Data directory
-DATA_DIR = Path("src/data/donor_divided")
+DATA_DIR = Path(os.getenv("SCGPT_AGE_DATA_DIR", "src/data/donor_divided"))
+AGEANNO_GENES_PATH = Path(
+    os.getenv("SCGPT_AGE_DEG_PATH", "src/data/Aging-related DEGs.txt")
+)
+SMOKE_CELLS_PER_CLASS = int(os.getenv("SCGPT_AGE_SMOKE_CELLS_PER_CLASS", "0"))
 
 # Output directory
-save_dir = Path("save/logistic_regression_multi_tissue_regul_orig_retrain")
+save_dir = Path(
+    os.getenv(
+        "SCGPT_AGE_LR_SAVE_DIR",
+        "save/logistic_regression_multi_tissue_regul_orig_retrain",
+    )
+)
 save_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -106,6 +121,28 @@ def prepare_data(adata_train, adata_test):
     adata_test.obs["age_id"] = [
         1 if x == "old" else 0 for x in adata_test.obs["age_category"]
     ]
+
+    overlap = set(adata_train.obs["orig.ident"].astype(str)) & set(
+        adata_test.obs["orig.ident"].astype(str)
+    )
+    if overlap:
+        raise ValueError(f"Donor leakage between train and test: {sorted(overlap)}")
+
+    if SMOKE_CELLS_PER_CLASS > 0:
+        rng = np.random.RandomState(42)
+
+        def subset_by_class(adata):
+            selected = []
+            for age_id in sorted(adata.obs["age_id"].unique()):
+                candidates = np.flatnonzero(adata.obs["age_id"].to_numpy() == age_id)
+                take = min(SMOKE_CELLS_PER_CLASS, len(candidates))
+                selected.extend(
+                    rng.choice(candidates, size=take, replace=False).tolist()
+                )
+            return adata[sorted(selected)].copy()
+
+        adata_train = subset_by_class(adata_train)
+        adata_test = subset_by_class(adata_test)
 
     # Extract features (gene expression) and labels
     # Use raw expression data (X) - convert sparse to dense if needed
@@ -171,7 +208,6 @@ def train_logistic_regression(
                     penalty="l1",
                     solver="liblinear",
                     C=C,
-                    multi_class="ovr",  # Use 'ovr' for binary classification with liblinear
                 ),
             ),
         ]
@@ -527,7 +563,7 @@ if __name__ == "__main__":
 
     # Load and filter aging-related DEGs for all tissues
     ageanno_genes = pd.read_csv(
-        "src/data/Aging-related DEGs.txt", encoding="iso-8859-1"
+        AGEANNO_GENES_PATH, encoding="iso-8859-1"
     )
     ageanno_genes = ageanno_genes[ageanno_genes["group"] == "old vs mid"]
     ageanno_genes = ageanno_genes[ageanno_genes["p_val_adj"] < 0.05]

@@ -57,6 +57,8 @@ The analysis uses the **AgeAnno dataset** [Huang et al., 2023] comprising scRNA-
   - Batch size: 256
   - Optimizer: AdamW with weight decay of 1×10⁻⁷
   - Loss: Binary cross-entropy with logits (BCEWithLogitsLoss) with class-specific weights
+  - Checkpoint: final state after the fixed 20-epoch schedule
+  - Test set: evaluated once after training; not used for scheduling or checkpoint selection
 - **Hardware**: NVIDIA RTX 4090 GPU (24 GB memory)
 
 ## Results
@@ -126,7 +128,7 @@ We used the AgeAnno dataset [Huang et al., 2023], comprising scRNA-seq data from
 
 The total number of cells included in the analysis for each tissue and age group is provided in Table: cell count per tissue.
 
-For each tissue type, the training and testing splits were performed at the donor level (i.e., all cells from a given donor were assigned exclusively to either the training or the test set). This donor-wise partitioning prevents data leakage and ensures that the model is evaluated on truly unseen individuals. No within-dataset batch correction was applied. All experiments were conducted with a fixed random seed to guarantee reproducibility across runs.
+For each tissue type, the training and testing splits were performed at the donor level (i.e., all cells from a given donor were assigned exclusively to either the training or the test set). Because several tissues contain too few donors to create a representative third split, training uses a fixed 20-epoch schedule without validation-based early stopping. The test subset is evaluated only once after training and is not used for learning-rate scheduling or checkpoint selection. No within-dataset batch correction was applied. All experiments were conducted with a fixed random seed to guarantee reproducibility across runs.
 
 For the preliminary complexity reduction step, we subsampled the gene set by selecting genes previously reported (in AgeAnno) to be significantly associated with aging in the comparison between mid-age and old-age groups (adjusted p-value < 0.05), further filtered to exclude genes exhibiting tissue-specific or cell-type-specific expression changes, and then intersected the filtered subset with the scGPT training genes, resulting in total 869 genes (Table S1).
 
@@ -207,9 +209,11 @@ python src/train_cls_decoder_on_embeddings.py
 ```
 Trains separate ImprovedCls classification heads on scGPT embeddings for each tissue. This script:
 - Loads the pre-trained frozen scGPT encoder
+- Verifies that the provided train and test donors do not overlap
 - Extracts cell embeddings from train and test data
 - Trains a separate ImprovedCls head for each tissue
-- Saves model weights and performance metrics
+- Uses the final checkpoint from the fixed 20-epoch schedule and evaluates test data once
+- Saves model weights, donor manifests, and performance metrics
 
 ### 2. Gene Perturbation Analysis
 ```bash
@@ -222,7 +226,7 @@ Performs systematic *in silico* gene perturbations to identify pro- and anti-agi
 - Computes statistical significance and classifies genes as pro-aging or anti-aging candidates
 - Saves results for downstream analysis
 
-**Configuration**: Edit the script to set `TISSUE` (default: "skin") and `N_CELLS_TO_SAMPLE` (default: 500).
+**Configuration**: Edit `TISSUES` to select tissues and `N_CELLS_TO_SAMPLE` to change the balanced sample size (default: 300).
 
 ### 3. Compare with Logistic Regression Baseline
 ```bash

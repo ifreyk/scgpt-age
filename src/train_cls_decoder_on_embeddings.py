@@ -7,9 +7,11 @@ instead of sklearn classifiers.
 
 For each tissue:
 1. Load pre-trained scGPT model (frozen)
-2. Extract cell embeddings from train and test data
-3. Train a separate ImprovedCls head on embeddings
-4. Save head weights and metrics
+2. Verify that the provided train and test sets contain disjoint donors
+3. Extract cell embeddings from train and test data
+4. Train a separate ImprovedCls head for a fixed number of epochs
+5. Evaluate the final checkpoint once on the untouched test set
+6. Save head weights, donor metadata, and metrics
 """
 #%%
 import copy
@@ -325,13 +327,16 @@ def _digitize(x: np.ndarray, bins: np.ndarray, side="both") -> np.ndarray:
     return digits
 
 
-# Configuration
-SCGPT_MODEL_PATH = "src/data/models/scGPT_human"
-DATA_DIR = Path("src/data/donor_divided")
-SAVE_DIR = Path("save/cls_decoder_on_embeddings_2500_cells")
+# Configuration. Environment overrides are intentionally optional so that smoke
+# runs can use a tiny subset without changing the full experiment defaults.
+SCGPT_MODEL_PATH = os.getenv("SCGPT_AGE_MODEL_DIR", "src/data/models/scGPT_human")
+DATA_DIR = Path(os.getenv("SCGPT_AGE_DATA_DIR", "src/data/donor_divided"))
+SAVE_DIR = Path(
+    os.getenv("SCGPT_AGE_CLS_SAVE_DIR", "save/cls_decoder_on_embeddings")
+)
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-TISSUES = [
+DEFAULT_TISSUES = [
     "skin",
     #"bladder",
     "blood",
@@ -343,6 +348,23 @@ TISSUES = [
     #"skeletal-muscle",
     #"stomach",
 ]
+TISSUES = [
+    tissue.strip()
+    for tissue in os.getenv("SCGPT_AGE_TISSUES", ",".join(DEFAULT_TISSUES)).split(",")
+    if tissue.strip()
+]
+
+
+def env_flag(name: str, default: bool) -> bool:
+    return os.getenv(name, str(int(default))).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+SMOKE_CELLS_PER_CLASS = int(os.getenv("SCGPT_AGE_SMOKE_CELLS_PER_CLASS", "0"))
 #%%
 # Configuration
 config = dict(
@@ -355,22 +377,21 @@ config = dict(
     layer_size=128,
     nlayers=12,
     nhead=8,
-    fast_transformer=True,
+    fast_transformer=env_flag("SCGPT_AGE_FAST_TRANSFORMER", True),
     pre_norm=False,
-    amp=True,
+    amp=env_flag("SCGPT_AGE_AMP", True),
     include_zero_gene=False,
     freeze=True,  # MUST be True - frozen model
     DSBN=False,
     # ImprovedCls training config
-    batch_size=256,
+    batch_size=int(os.getenv("SCGPT_AGE_BATCH_SIZE", "256")),
     lr=1e-4,
-    epochs=20,
+    epochs=int(os.getenv("SCGPT_AGE_EPOCHS", "20")),
     weight_decay=1e-7,
-    label_smoothing=0.15,
-    use_bce_loss=False,  # Use BCEWithLogitsLoss for binary classification
+    donor_key="orig.ident",
+    use_bce_loss=True,
     hidden_dim=1024,  # Hidden dimension (None = same as d_model)
     dropout=0.4,
-    min_lr=1e-6
 )
 # Set up logger
 logger = scg.logger
@@ -401,7 +422,7 @@ special_tokens = [pad_token, "<cls>", "<eoc>"]
 mask_ratio = config["mask_ratio"]
 mask_value = "auto"
 include_zero_gene = config["include_zero_gene"]
-max_seq_len = 2500
+max_seq_len = int(os.getenv("SCGPT_AGE_MAX_SEQ_LEN", "2500"))
 n_bins = config["n_bins"]
 input_style = "binned"
 output_style = "binned"
@@ -443,12 +464,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
 
 # Load aging-related DEGs for filtering
-ageanno_genes_path = Path("src/data/Aging-related DEGs.txt")
+ageanno_genes_path = Path(
+    os.getenv("SCGPT_AGE_DEG_PATH", "src/data/Aging-related DEGs.txt")
+)
 if not ageanno_genes_path.exists():
     logger.error(f"Aging-related DEGs file not found: {ageanno_genes_path}")
     sys.exit(1)
 
-ageanno_genes = pd.read_csv("src/data/Aging-related DEGs.txt", encoding='iso-8859-1')
+ageanno_genes = pd.read_csv(ageanno_genes_path, encoding='iso-8859-1')
 ageanno_genes = ageanno_genes[ageanno_genes['group']=='old vs mid']
 # ageanno_genes = ageanno_genes[ageanno_genes['p_val_adj']<0.05]
 # ageanno_genes = ageanno_genes[(ageanno_genes['isTissuespecific']==False) & (ageanno_genes['isCellTypespecific']==False)]
@@ -535,6 +558,39 @@ model.eval()  # Set to eval mode for embedding extraction
 logger.info("Model loaded and frozen successfully")
 
 
+def assert_disjoint_donors(
+    first: AnnData,
+    second: AnnData,
+    donor_key: str,
+    first_name: str,
+    second_name: str,
+) -> None:
+    """Fail fast when two datasets contain cells from the same donor."""
+    first_donors = set(first.obs[donor_key].astype(str).unique())
+    second_donors = set(second.obs[donor_key].astype(str).unique())
+    overlap = first_donors & second_donors
+    if overlap:
+        raise ValueError(
+            f"Donor leakage between {first_name} and {second_name}: {sorted(overlap)}"
+        )
+
+
+def stratified_cell_smoke_subset(adata: AnnData, cells_per_class: int) -> AnnData:
+    """Select a deterministic, class-balanced cell subset for a smoke run."""
+    if cells_per_class <= 0:
+        return adata
+
+    selected = []
+    rng = np.random.RandomState(config["seed"])
+    for age_id in sorted(adata.obs["age_id"].unique()):
+        candidates = np.flatnonzero(adata.obs["age_id"].to_numpy() == age_id)
+        take = min(cells_per_class, len(candidates))
+        if take == 0:
+            continue
+        selected.extend(rng.choice(candidates, size=take, replace=False).tolist())
+    return adata[sorted(selected)].copy()
+
+
 def return_data_age_batch(adata_to_use):
     input_layer_key = {
         "normed_raw": "X_normed",
@@ -542,7 +598,7 @@ def return_data_age_batch(adata_to_use):
         "binned": "X_binned",
     }[input_style]
     all_counts = (
-        adata_to_use.layers[input_layer_key].A
+        adata_to_use.layers[input_layer_key].toarray()
         if issparse(adata_to_use.layers[input_layer_key])
         else adata_to_use.layers[input_layer_key]
     )
@@ -646,51 +702,45 @@ def extract_embeddings(model, data_pt, age_labels, batch_size=64):
 def train_cls_decoder(
     train_embeddings,
     train_labels,
-    test_embeddings,
-    test_labels,
     embsize,
     n_classes,
     config,
 ):
-    """Train ImprovedCls head on embeddings, validate on test set"""
+    """Train ImprovedCls head for the preconfigured number of epochs."""
     logger.info("Training ImprovedCls head...")
 
-    # # Create model with improved architecture
-    # cls_decoder = ImprovedCls(
-    #     d_model=embsize,
-    #     n_cls=n_classes,
-    #     nlayers=5,
-    #     activation=nn.SiLU,
-    #     dropout=config.get("dropout", 0.1),
-    #     use_residual=config.get("use_residual", True),
-    #     use_batch_norm=config.get("use_batch_norm", False),
-    #     hidden_dim=config.get("hidden_dim", None),
-    # ).to(device)
-    cls_decoder = ImprovedCls(embsize, n_classes, dropout=config.get("dropout", 0.2),
-                              nlayers=5, activation=nn.GELU, use_residual=True, use_batch_norm=False, hidden_dim=1024).to(device)
-    # Create data loaders
+    use_bce = config.get("use_bce_loss", False) and n_classes == 2
+    decoder_output_dim = 1 if use_bce else n_classes
+    cls_decoder = ImprovedCls(
+        embsize,
+        decoder_output_dim,
+        dropout=config.get("dropout", 0.2),
+        nlayers=5,
+        activation=nn.GELU,
+        use_residual=True,
+        use_batch_norm=False,
+        hidden_dim=1024,
+    ).to(device)
+
+    # Create the training loader. Test data is deliberately not accepted here.
     train_dataset = torch.utils.data.TensorDataset(
         torch.from_numpy(train_embeddings).float(),
         torch.from_numpy(train_labels).long(),
-    )
-    test_dataset = torch.utils.data.TensorDataset(
-        torch.from_numpy(test_embeddings).float(),
-        torch.from_numpy(test_labels).long(),
     )
 
     train_loader = DataLoader(
         train_dataset, batch_size=config["batch_size"], shuffle=True
     )
-    test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
     # Loss and optimizer
-    use_bce = config.get("use_bce_loss", False) and n_classes == 2
+    pos_weight_value = None
     if use_bce:
-        # Calculate class weights for balanced loss
+        # pos_weight makes positive and negative examples contribute equally in aggregate.
         pos_count = np.sum(train_labels == 1)
         neg_count = np.sum(train_labels == 0)
         if pos_count > 0 and neg_count > 0:
-            pos_weight = torch.tensor([neg_count / pos_count], dtype=torch.float32).to(device)
+            pos_weight_value = float(neg_count / pos_count)
+            pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32).to(device)
             logger.info(f"Using BCEWithLogitsLoss with pos_weight={pos_weight.item():.4f} (pos: {pos_count}, neg: {neg_count})")
         else:
             pos_weight = None
@@ -699,8 +749,6 @@ def train_cls_decoder(
         logger.info("Using BCEWithLogitsLoss for binary classification")
     else:
         criterion = nn.CrossEntropyLoss()
-            # label_smoothing=config["label_smoothing"]
-            # )
         logger.info("Using CrossEntropyLoss")
     
     optimizer = torch.optim.AdamW(
@@ -708,15 +756,8 @@ def train_cls_decoder(
         lr=config["lr"],
         weight_decay=config["weight_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=20, verbose=True,min_lr=config["min_lr"]
-    )
 
-    # Training loop
-    best_test_auc = 0.0
-    best_test_loss = float("inf")
-    best_model_state = None
-
+    # Fixed-length training: no validation/test-based early stopping or scheduling.
     for epoch in range(config["epochs"]):
         # Train
         cls_decoder.train()
@@ -732,8 +773,7 @@ def train_cls_decoder(
             logits = cls_decoder(batch_emb)
             
             if use_bce:
-                # For BCE: use logits for class 1, convert labels to float
-                logits_bce = logits[:, 1]
+                logits_bce = logits.squeeze(-1)
                 labels_bce = batch_labels.float()
                 loss = criterion(logits_bce, labels_bce)
             else:
@@ -744,8 +784,7 @@ def train_cls_decoder(
 
             train_loss += loss.item()
             if use_bce:
-                # For BCE: apply sigmoid and threshold at 0.5
-                probs = torch.sigmoid(logits[:, 1])
+                probs = torch.sigmoid(logits.squeeze(-1))
                 preds = (probs > 0.5).long()
             else:
                 preds = logits.argmax(dim=1)
@@ -755,76 +794,19 @@ def train_cls_decoder(
         train_loss /= len(train_loader)
         train_acc = train_correct / train_total
 
-        # Evaluate on test set
-        cls_decoder.eval()
-        test_loss = 0.0
-        test_correct = 0
-        test_total = 0
-        all_test_probs = []
-        all_test_labels = []
-
-        with torch.no_grad():
-            for batch_emb, batch_labels in test_loader:
-                batch_emb = batch_emb.to(device)
-                batch_labels = batch_labels.to(device)
-
-                logits = cls_decoder(batch_emb)
-                
-                if use_bce:
-                    # For BCE: use logits for class 1, convert labels to float
-                    logits_bce = logits[:, 1]
-                    labels_bce = batch_labels.float()
-                    loss = criterion(logits_bce, labels_bce)
-                    # For BCE: apply sigmoid to get probabilities
-                    probs_bce = torch.sigmoid(logits_bce)
-                    probs = torch.stack([1 - probs_bce, probs_bce], dim=1)
-                    preds = (probs_bce > 0.5).long()
-                else:
-                    loss = criterion(logits, batch_labels)
-                    probs = F.softmax(logits, dim=1)
-                    preds = logits.argmax(dim=1)
-
-                test_loss += loss.item()
-                test_correct += (preds == batch_labels).sum().item()
-                test_total += len(batch_labels)
-
-                all_test_probs.append(probs.cpu().numpy())
-                all_test_labels.append(batch_labels.cpu().numpy())
-
-        test_loss /= len(test_loader)
-        test_acc = test_correct / test_total
-
-        all_test_probs = np.concatenate(all_test_probs, axis=0)
-        all_test_labels = np.concatenate(all_test_labels, axis=0)
-        test_auc = roc_auc_score(all_test_labels, all_test_probs[:, 1])
-
-        scheduler.step(test_loss)
-
-        if (epoch + 1) % 10 == 0:
+        if epoch == 0 or (epoch + 1) % 10 == 0 or epoch + 1 == config["epochs"]:
             logger.info(
                 f"Epoch {epoch+1}/{config['epochs']} - "
-                f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} - "
-                f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}"
+                f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}"
             )
 
-        # Track best model based on test AUC (higher is better)
-        if test_auc > best_test_auc:
-            best_test_auc = test_auc
-            best_test_loss = test_loss
-            best_model_state = copy.deepcopy(cls_decoder.state_dict())
+    final_model_state = copy.deepcopy(cls_decoder.state_dict())
 
-    # Load best model
-    if best_model_state is not None:
-        cls_decoder.load_state_dict(best_model_state)
-    else:
-        # If no best model was found (shouldn't happen), use current state
-        best_model_state = cls_decoder.state_dict()
-
-    return cls_decoder, best_model_state, {
+    return cls_decoder, final_model_state, {
         "train_acc": train_acc,
-        "test_acc": test_acc,
-        "test_auc": best_test_auc,
-        "test_loss": best_test_loss,
+        "train_loss": train_loss,
+        "epochs": int(config["epochs"]),
+        "pos_weight": pos_weight_value,
     }
 
 
@@ -852,8 +834,7 @@ def evaluate_cls_decoder(cls_decoder, test_embeddings, test_labels, device, use_
             logits = cls_decoder(batch_emb)
             
             if use_bce:
-                # For BCE: apply sigmoid to get probabilities
-                probs_bce = torch.sigmoid(logits[:, 1])
+                probs_bce = torch.sigmoid(logits.squeeze(-1))
                 probs = torch.stack([1 - probs_bce, probs_bce], dim=1)
                 preds = (probs_bce > 0.5).long()
             else:
@@ -946,6 +927,26 @@ for tissue in TISSUES:
     adata_train.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_train.obs['age_category']]
     adata_test.obs["age_id"] = [1 if x == 'old' else 0 for x in adata_test.obs['age_category']]
 
+    donor_key = config["donor_key"]
+    assert_disjoint_donors(
+        adata_train,
+        adata_test,
+        donor_key=donor_key,
+        first_name="provided train set",
+        second_name="test set",
+    )
+
+    if SMOKE_CELLS_PER_CLASS > 0:
+        adata_train = stratified_cell_smoke_subset(
+            adata_train, SMOKE_CELLS_PER_CLASS
+        )
+        adata_test = stratified_cell_smoke_subset(adata_test, SMOKE_CELLS_PER_CLASS)
+        logger.info(
+            "Smoke cell subset: "
+            f"train={adata_train.n_obs}, test={adata_test.n_obs}, "
+            f"up to {SMOKE_CELLS_PER_CLASS} cells per class"
+        )
+
     # Filter to aging-related DEGs
     train_gene_names = set(adata_train.var_names)
     test_gene_names = set(adata_test.var_names)
@@ -967,6 +968,22 @@ for tissue in TISSUES:
     logger.info(
         f"match {np.sum(gene_ids_in_vocab >= 0)}/{len(gene_ids_in_vocab)} genes "
         f"in vocabulary of size {len(vocab)}."
+    )
+
+    split_manifest = {
+        "train_donors": sorted(
+            adata_train.obs[donor_key].astype(str).unique().tolist()
+        ),
+        "test_donors": sorted(
+            adata_test.obs[donor_key].astype(str).unique().tolist()
+        ),
+        "train_cells": int(adata_train.n_obs),
+        "test_cells": int(adata_test.n_obs),
+    }
+    logger.info(
+        "Donor-wise split: "
+        f"{len(split_manifest['train_donors'])} train donors, "
+        f"{len(split_manifest['test_donors'])} test donors"
     )
 
     # Preprocess
@@ -1048,11 +1065,15 @@ for tissue in TISSUES:
     logger.info(f"Train: {train_embeddings.shape[0]} samples")
     logger.info(f"Test: {test_embeddings.shape[0]} samples")
 
-    # Train classifier head (train on full train set, validate on test set)
+    # Train for a fixed number of epochs without using test metrics for selection.
     n_classes = len(np.unique(train_labels))
     use_bce = config.get("use_bce_loss", False) and n_classes == 2
-    cls_decoder, best_model_state, train_metrics = train_cls_decoder(
-        train_embeddings, train_labels, test_embeddings, test_labels, embsize, n_classes, config
+    cls_decoder, final_model_state, train_metrics = train_cls_decoder(
+        train_embeddings,
+        train_labels,
+        embsize,
+        n_classes,
+        config,
     )
 
     # Final evaluation on test set
@@ -1060,9 +1081,11 @@ for tissue in TISSUES:
         cls_decoder, test_embeddings, test_labels, device, use_bce=use_bce
     )
 
-    # Save model weights (best model state)
-    torch.save(best_model_state, save_dir / "best_model.pt")
-    logger.info(f"Saved best model state to {save_dir / 'best_model.pt'}")
+    # Save the fixed final-epoch checkpoint. best_model.pt is kept as a
+    # compatibility alias for downstream scripts created before this change.
+    torch.save(final_model_state, save_dir / "final_model.pt")
+    torch.save(final_model_state, save_dir / "best_model.pt")
+    logger.info(f"Saved final model state to {save_dir / 'final_model.pt'}")
     
     # Also save current state for reference
     torch.save(cls_decoder.state_dict(), save_dir / "cls_decoder_weights.pt")
@@ -1073,8 +1096,13 @@ for tissue in TISSUES:
         "tissue": tissue,
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
+        "split": split_manifest,
+        "checkpoint_selection": "fixed_final_epoch",
         "config": config,
     }
+
+    with open(save_dir / "split_manifest.json", "w") as f:
+        json.dump(split_manifest, f, indent=4)
 
     with open(save_dir / "results.json", "w") as f:
         json.dump(results, f, indent=4)
